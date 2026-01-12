@@ -1,0 +1,31 @@
+# Rust build artifacts
+/target
+/target-local
+
+# Environment and secrets
+/.env
+.env.*
+*.pem
+*.key
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+server.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Node.js (napi-node)
+napi-node/node_modules/
+napi-node/*.node
+napi-node/npm/
+
+# Claude Code plans (local development)
+.claude/

@@ -1,0 +1,1463 @@
+use crate::catalog::ProductCatalog;
+use crate::crypto::{canonicalize, sign_detached, verify_detached, DetachedJws, SigningKey, VerifyingKey};
+use crate::errors::ServiceError;
+use crate::events::{Event, EventSender};
+use crate::models::{
+    AppliedDiscount, Ap2CheckoutResponse, CheckoutCompleteRequest, CheckoutCreateRequest,
+    CheckoutResponse, CheckoutStatus, CheckoutUpdateRequest, DiscountAllocation, DiscountsObject,
+    Fulfillment, FulfillmentAvailableMethod, FulfillmentGroup, FulfillmentMethod,
+    FulfillmentOption, LineItemInput, LineItemResponse, Link, Message, Order, OrderConfirmation,
+    OrderFulfillment, OrderLineItem, OrderQuantity, PaymentHandler, PaymentInstrument,
+    PaymentRequest, PaymentResponse, Total, UcpResponseMeta,
+};
+use crate::store::CheckoutStore;
+use crate::validation::{normalize_currency, validate_checkout_id, validate_quantity};
+use chrono::{Duration as ChronoDuration, Utc};
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
+use uuid::Uuid;
+
+const CHECKOUT_CAPABILITY: &str = "dev.ucp.shopping.checkout";
+const ORDER_CAPABILITY: &str = "dev.ucp.shopping.order";
+const FULFILLMENT_CAPABILITY: &str = "dev.ucp.shopping.fulfillment";
+const DISCOUNT_CAPABILITY: &str = "dev.ucp.shopping.discount";
+const AP2_MANDATE_CAPABILITY: &str = "dev.ucp.shopping.ap2_mandate";
+const IDENTITY_LINKING_CAPABILITY: &str = "dev.ucp.common.identity_linking";
+const BUYER_CONSENT_CAPABILITY: &str = "dev.ucp.shopping.buyer_consent";
+
+struct DiscountOutcome {
+    discounts: Option<DiscountsObject>,
+    items_discount: i64,
+    order_discount: i64,
+}
+
+#[derive(Clone)]
+pub struct CheckoutService {
+    store: CheckoutStore,
+    catalog: ProductCatalog,
+    event_sender: EventSender,
+    ucp_version: String,
+    service_version: String,
+    base_url: String,
+    session_ttl_seconds: u64,
+    tax_bps: i64,
+    handlers: Vec<PaymentHandler>,
+    default_links: Vec<Link>,
+    signing_keys: Option<Vec<crate::models::JwkKey>>,
+    identity_linking_enabled: bool,
+    buyer_consent_enabled: bool,
+    ap2_enabled: bool,
+    ap2_merchant_authorization: Option<String>,
+    ap2_signing_key: Option<SigningKey>,
+}
+
+impl CheckoutService {
+    pub fn new(
+        store: CheckoutStore,
+        catalog: ProductCatalog,
+        event_sender: EventSender,
+        ucp_version: String,
+        service_version: String,
+        base_url: String,
+        session_ttl_seconds: u64,
+        tax_bps: i64,
+        signing_keys: Option<Vec<crate::models::JwkKey>>,
+        identity_linking_enabled: bool,
+        buyer_consent_enabled: bool,
+        ap2_enabled: bool,
+        ap2_merchant_authorization: Option<String>,
+        ap2_signing_key: Option<SigningKey>,
+    ) -> Self {
+        let handlers = vec![PaymentHandler {
+            id: "ucp_card".to_string(),
+            name: "dev.ucp.payments.card".to_string(),
+            version: ucp_version.clone(),
+            spec: "https://ucp.dev/specification/payment-handler-template".to_string(),
+            config_schema: "https://ucp.dev/specification/payment-handler-template".to_string(),
+            instrument_schemas: vec![
+                "https://ucp.dev/schemas/shopping/types/card_payment_instrument.json".to_string(),
+            ],
+            config: serde_json::json!({ "environment": "sandbox" }),
+        }];
+
+        let default_links = vec![
+            Link {
+                link_type: "terms_of_service".to_string(),
+                url: format!("{}/terms", base_url),
+                title: None,
+            },
+            Link {
+                link_type: "privacy_policy".to_string(),
+                url: format!("{}/privacy", base_url),
+                title: None,
+            },
+        ];
+
+        Self {
+            store,
+            catalog,
+            event_sender,
+            ucp_version,
+            service_version,
+            base_url,
+            session_ttl_seconds,
+            tax_bps,
+            handlers,
+            default_links,
+            signing_keys,
+            identity_linking_enabled,
+            buyer_consent_enabled,
+            ap2_enabled,
+            ap2_merchant_authorization,
+            ap2_signing_key,
+        }
+    }
+
+    pub async fn create_checkout(
+        &self,
+        request: CheckoutCreateRequest,
+    ) -> Result<CheckoutResponse, ServiceError> {
+        if request.line_items.is_empty() {
+            return Err(ServiceError::InvalidInput(
+                "line_items must contain at least one item".to_string(),
+            ));
+        }
+
+        let currency = normalize_currency(&request.currency)?;
+        let mut line_items = self.build_line_items(&request.line_items, &currency)?;
+        let (fulfillment, fulfillment_cost) =
+            self.build_fulfillment(request.fulfillment, &line_items)?;
+        let discount_outcome =
+            self.apply_discounts(&mut line_items, request.discounts, fulfillment_cost)?;
+        let totals = self.calculate_totals(
+            &line_items,
+            discount_outcome.items_discount,
+            fulfillment_cost,
+            discount_outcome.order_discount,
+        )?;
+
+        let buyer_has_consent = request
+            .buyer
+            .as_ref()
+            .and_then(|buyer| buyer.consent.as_ref())
+            .is_some();
+        let payment = self.build_payment_response(request.payment, None);
+
+        let mut checkout = CheckoutResponse {
+            ucp: self.response_meta_for(
+                fulfillment.is_some(),
+                discount_outcome.discounts.is_some(),
+                buyer_has_consent,
+                self.ap2_enabled,
+            ),
+            id: format!("chk_{}", Uuid::new_v4()),
+            line_items,
+            buyer: request.buyer,
+            status: CheckoutStatus::Incomplete,
+            currency,
+            totals,
+            discounts: discount_outcome.discounts,
+            fulfillment,
+            messages: None,
+            links: self.default_links.clone(),
+            expires_at: Some(self.expires_at()),
+            continue_url: None,
+            payment,
+            ap2: None, // Will be set after checkout is built
+            order: None,
+            extra: request.extra,
+        };
+
+        self.apply_status(&mut checkout);
+
+        // Generate AP2 merchant authorization after checkout is built
+        checkout.ap2 = self.ap2_response_for_checkout(&checkout);
+
+        let ttl = Duration::from_secs(self.session_ttl_seconds);
+        self.store.insert(checkout.clone(), Some(ttl)).await;
+
+        Ok(checkout)
+    }
+
+    pub async fn get_checkout(&self, checkout_id: &str) -> Result<CheckoutResponse, ServiceError> {
+        self.store
+            .get(checkout_id)
+            .await
+            .ok_or_else(|| ServiceError::NotFound(format!("Checkout {} not found", checkout_id)))
+    }
+
+    pub async fn update_checkout(
+        &self,
+        checkout_id: &str,
+        request: CheckoutUpdateRequest,
+    ) -> Result<CheckoutResponse, ServiceError> {
+        validate_checkout_id(checkout_id, &request.id)?;
+
+        let existing = self.get_checkout(checkout_id).await?;
+        let existing_fulfillment = existing.fulfillment.clone();
+        let existing_discounts = existing.discounts.clone();
+        let existing_payment = existing.payment.clone();
+        if matches!(existing.status, CheckoutStatus::Completed | CheckoutStatus::Canceled) {
+            return Err(ServiceError::InvalidState(
+                "Checkout session cannot be updated".to_string(),
+            ));
+        }
+
+        let currency = normalize_currency(&request.currency)?;
+        let mut line_items = self.build_line_items(&request.line_items, &currency)?;
+
+        let fulfillment_input = request.fulfillment.or(existing_fulfillment);
+        let (fulfillment, fulfillment_cost) =
+            self.build_fulfillment(fulfillment_input, &line_items)?;
+
+        let discount_input = request.discounts.or(existing_discounts);
+        let discount_outcome =
+            self.apply_discounts(&mut line_items, discount_input, fulfillment_cost)?;
+
+        let totals = self.calculate_totals(
+            &line_items,
+            discount_outcome.items_discount,
+            fulfillment_cost,
+            discount_outcome.order_discount,
+        )?;
+
+        let buyer = request.buyer.or(existing.buyer);
+        let buyer_has_consent = buyer
+            .as_ref()
+            .and_then(|buyer| buyer.consent.as_ref())
+            .is_some();
+        let payment = self.build_payment_response(request.payment, Some(existing_payment));
+
+        let mut extra = existing.extra;
+        for (key, value) in request.extra {
+            extra.insert(key, value);
+        }
+
+        let mut checkout = CheckoutResponse {
+            ucp: self.response_meta_for(
+                fulfillment.is_some(),
+                discount_outcome.discounts.is_some(),
+                buyer_has_consent,
+                self.ap2_enabled,
+            ),
+            id: existing.id,
+            line_items,
+            buyer,
+            status: CheckoutStatus::Incomplete,
+            currency,
+            totals,
+            discounts: discount_outcome.discounts,
+            fulfillment,
+            messages: None,
+            links: self.default_links.clone(),
+            expires_at: existing.expires_at,
+            continue_url: existing.continue_url,
+            payment,
+            ap2: None, // Will be set after checkout is built
+            order: None,
+            extra,
+        };
+
+        self.apply_status(&mut checkout);
+
+        // Generate AP2 merchant authorization after checkout is built
+        checkout.ap2 = self.ap2_response_for_checkout(&checkout);
+
+        let ttl = Duration::from_secs(self.session_ttl_seconds);
+        self.store.insert(checkout.clone(), Some(ttl)).await;
+
+        Ok(checkout)
+    }
+
+    pub async fn complete_checkout(
+        &self,
+        checkout_id: &str,
+        request: CheckoutCompleteRequest,
+    ) -> Result<CheckoutResponse, ServiceError> {
+        let mut checkout = self.get_checkout(checkout_id).await?;
+
+        if matches!(checkout.status, CheckoutStatus::Completed) {
+            return Err(ServiceError::InvalidState(
+                "Checkout session already completed".to_string(),
+            ));
+        }
+
+        if matches!(checkout.status, CheckoutStatus::Canceled) {
+            return Err(ServiceError::InvalidState(
+                "Checkout session is canceled".to_string(),
+            ));
+        }
+
+        if !matches!(checkout.status, CheckoutStatus::ReadyForComplete) {
+            return Err(ServiceError::InvalidState(
+                "Checkout session is not ready for completion".to_string(),
+            ));
+        }
+
+        if self.ap2_enabled {
+            let mandate = request
+                .ap2
+                .as_ref()
+                .map(|ap2| ap2.checkout_mandate.trim())
+                .filter(|value| !value.is_empty());
+            if mandate.is_none() {
+                return Err(ServiceError::InvalidInput(
+                    "ap2.checkout_mandate is required".to_string(),
+                ));
+            }
+        }
+
+        self.attach_payment_data(&mut checkout, request.payment_data)?;
+
+        let order_id = format!("order_{}", Uuid::new_v4());
+        let order = self.build_order(&checkout, &order_id)?;
+
+        checkout.order = Some(OrderConfirmation {
+            id: order_id.clone(),
+            permalink_url: order.permalink_url.clone(),
+            extra: HashMap::new(),
+        });
+
+        checkout.ap2 = self.ap2_response();
+        checkout.status = CheckoutStatus::Completed;
+        checkout.messages = None;
+
+        let ttl = Duration::from_secs(self.session_ttl_seconds);
+        self.store.insert(checkout.clone(), Some(ttl)).await;
+
+        self.event_sender
+            .send(Event::OrderCreated { order })
+            .await;
+
+        Ok(checkout)
+    }
+
+    pub async fn cancel_checkout(&self, checkout_id: &str) -> Result<CheckoutResponse, ServiceError> {
+        let mut checkout = self.get_checkout(checkout_id).await?;
+
+        if matches!(checkout.status, CheckoutStatus::Completed | CheckoutStatus::Canceled) {
+            return Err(ServiceError::InvalidState(
+                "Checkout session cannot be canceled".to_string(),
+            ));
+        }
+
+        checkout.status = CheckoutStatus::Canceled;
+        checkout.messages = None;
+
+        let ttl = Duration::from_secs(self.session_ttl_seconds);
+        self.store.insert(checkout.clone(), Some(ttl)).await;
+
+        Ok(checkout)
+    }
+
+    pub fn discovery_document(&self) -> crate::models::DiscoveryDocument {
+        let mut services = HashMap::new();
+        services.insert(
+            "dev.ucp.shopping".to_string(),
+            crate::models::ServiceDefinition {
+                version: self.service_version.clone(),
+                spec: "https://ucp.dev/specification/overview".to_string(),
+                rest: Some(crate::models::ServiceEndpoint {
+                    schema: "https://ucp.dev/services/shopping/rest.openapi.json".to_string(),
+                    endpoint: format!("{}/api", self.base_url),
+                }),
+                mcp: Some(crate::models::ServiceEndpoint {
+                    schema: format!("{}/schemas/shopping/mcp.openrpc.json", self.base_url),
+                    endpoint: format!("{}/mcp", self.base_url),
+                }),
+                a2a: Some(crate::models::A2AEndpoint {
+                    agent_card: format!("{}/.well-known/agent-card.json", self.base_url),
+                    endpoint: format!("{}/a2a", self.base_url),
+                }),
+                embedded: Some(crate::models::EmbeddedEndpoint {
+                    schema: "https://ucp.dev/services/shopping/embedded.openrpc.json".to_string(),
+                }),
+            },
+        );
+
+        let mut capabilities = vec![
+            crate::models::Capability {
+                name: CHECKOUT_CAPABILITY.to_string(),
+                version: self.ucp_version.clone(),
+                spec: "https://ucp.dev/specification/checkout".to_string(),
+                schema: "https://ucp.dev/schemas/shopping/checkout.json".to_string(),
+                extends: None,
+                config: None,
+            },
+            crate::models::Capability {
+                name: FULFILLMENT_CAPABILITY.to_string(),
+                version: self.ucp_version.clone(),
+                spec: "https://ucp.dev/specification/fulfillment".to_string(),
+                schema: "https://ucp.dev/schemas/shopping/fulfillment.json".to_string(),
+                extends: Some(CHECKOUT_CAPABILITY.to_string()),
+                config: None,
+            },
+            crate::models::Capability {
+                name: DISCOUNT_CAPABILITY.to_string(),
+                version: self.ucp_version.clone(),
+                spec: "https://ucp.dev/specification/discount".to_string(),
+                schema: "https://ucp.dev/schemas/shopping/discount.json".to_string(),
+                extends: Some(CHECKOUT_CAPABILITY.to_string()),
+                config: None,
+            },
+            crate::models::Capability {
+                name: ORDER_CAPABILITY.to_string(),
+                version: self.ucp_version.clone(),
+                spec: "https://ucp.dev/specification/order".to_string(),
+                schema: "https://ucp.dev/schemas/shopping/order.json".to_string(),
+                extends: None,
+                config: None,
+            },
+        ];
+
+        if self.identity_linking_enabled {
+            capabilities.push(crate::models::Capability {
+                name: IDENTITY_LINKING_CAPABILITY.to_string(),
+                version: self.ucp_version.clone(),
+                spec: "https://ucp.dev/specification/identity-linking".to_string(),
+                schema: "https://ucp.dev/specification/identity-linking".to_string(),
+                extends: None,
+                config: None,
+            });
+        }
+
+        if self.buyer_consent_enabled {
+            capabilities.push(crate::models::Capability {
+                name: BUYER_CONSENT_CAPABILITY.to_string(),
+                version: self.ucp_version.clone(),
+                spec: "https://ucp.dev/specification/buyer-consent".to_string(),
+                schema: "https://ucp.dev/schemas/shopping/buyer_consent.json".to_string(),
+                extends: Some(CHECKOUT_CAPABILITY.to_string()),
+                config: None,
+            });
+        }
+
+        if self.ap2_enabled {
+            capabilities.push(crate::models::Capability {
+                name: AP2_MANDATE_CAPABILITY.to_string(),
+                version: self.ucp_version.clone(),
+                spec: "https://ucp.dev/specification/ap2-mandate".to_string(),
+                schema: "https://ucp.dev/schemas/shopping/ap2_mandate.json".to_string(),
+                extends: Some(CHECKOUT_CAPABILITY.to_string()),
+                config: None,
+            });
+        }
+
+        crate::models::DiscoveryDocument {
+            ucp: crate::models::UcpDiscoveryProfile {
+                version: self.ucp_version.clone(),
+                services,
+                capabilities,
+            },
+            payment: Some(crate::models::DiscoveryPayment {
+                handlers: self.handlers.clone(),
+            }),
+            signing_keys: self.signing_keys.clone(),
+            extra: HashMap::new(),
+        }
+    }
+
+    fn response_meta(&self) -> UcpResponseMeta {
+        self.response_meta_for(false, false, false, false)
+    }
+
+    fn response_meta_for(
+        &self,
+        include_fulfillment: bool,
+        include_discount: bool,
+        include_buyer_consent: bool,
+        include_ap2: bool,
+    ) -> UcpResponseMeta {
+        let mut capabilities = vec![crate::models::CapabilityRef {
+            name: CHECKOUT_CAPABILITY.to_string(),
+            version: self.ucp_version.clone(),
+        }];
+
+        if include_fulfillment {
+            capabilities.push(crate::models::CapabilityRef {
+                name: FULFILLMENT_CAPABILITY.to_string(),
+                version: self.ucp_version.clone(),
+            });
+        }
+
+        if include_discount {
+            capabilities.push(crate::models::CapabilityRef {
+                name: DISCOUNT_CAPABILITY.to_string(),
+                version: self.ucp_version.clone(),
+            });
+        }
+
+        if include_buyer_consent && self.buyer_consent_enabled {
+            capabilities.push(crate::models::CapabilityRef {
+                name: BUYER_CONSENT_CAPABILITY.to_string(),
+                version: self.ucp_version.clone(),
+            });
+        }
+
+        if include_ap2 && self.ap2_enabled {
+            capabilities.push(crate::models::CapabilityRef {
+                name: AP2_MANDATE_CAPABILITY.to_string(),
+                version: self.ucp_version.clone(),
+            });
+        }
+
+        UcpResponseMeta {
+            version: self.ucp_version.clone(),
+            capabilities,
+        }
+    }
+
+    fn order_meta(&self) -> UcpResponseMeta {
+        UcpResponseMeta {
+            version: self.ucp_version.clone(),
+            capabilities: vec![crate::models::CapabilityRef {
+                name: ORDER_CAPABILITY.to_string(),
+                version: self.ucp_version.clone(),
+            }],
+        }
+    }
+
+    fn ap2_response(&self) -> Option<Ap2CheckoutResponse> {
+        if !self.ap2_enabled {
+            return None;
+        }
+
+        // If we have a static merchant_authorization, use it (legacy mode)
+        if let Some(authorization) = &self.ap2_merchant_authorization {
+            return Some(Ap2CheckoutResponse {
+                merchant_authorization: authorization.clone(),
+            });
+        }
+
+        // Otherwise, we'll generate it dynamically per checkout in ap2_response_for_checkout
+        None
+    }
+
+    /// Generates AP2 merchant authorization for a specific checkout.
+    /// This creates a detached JWS signature over the canonicalized checkout data.
+    fn ap2_response_for_checkout(&self, checkout: &CheckoutResponse) -> Option<Ap2CheckoutResponse> {
+        if !self.ap2_enabled {
+            return None;
+        }
+
+        // If we have a static authorization, use it
+        if let Some(authorization) = &self.ap2_merchant_authorization {
+            return Some(Ap2CheckoutResponse {
+                merchant_authorization: authorization.clone(),
+            });
+        }
+
+        // Generate dynamic signature using signing key
+        let signing_key = self.ap2_signing_key.as_ref()?;
+
+        // Build the payload to sign (checkout without ap2 field)
+        let mut checkout_value = serde_json::to_value(checkout).ok()?;
+        if let Some(obj) = checkout_value.as_object_mut() {
+            obj.remove("ap2"); // Exclude ap2 field from signing
+        }
+
+        // Canonicalize and sign
+        let canonical = canonicalize(&checkout_value).ok()?;
+        let jws = sign_detached(&canonical, signing_key).ok()?;
+
+        Some(Ap2CheckoutResponse {
+            merchant_authorization: jws.to_compact(),
+        })
+    }
+
+    fn build_line_items(
+        &self,
+        items: &[LineItemInput],
+        currency: &str,
+    ) -> Result<Vec<LineItemResponse>, ServiceError> {
+        let mut line_items = Vec::with_capacity(items.len());
+
+        for item in items {
+            validate_quantity(item.quantity)?;
+            self.catalog.check_inventory(&item.item.id, item.quantity)?;
+
+            let product = self.catalog.get(&item.item.id)?;
+            if product.currency.to_uppercase() != currency {
+                return Err(ServiceError::InvalidInput(format!(
+                    "Item {} uses currency {}, expected {}",
+                    product.id, product.currency, currency
+                )));
+            }
+
+            let line_item_id = item
+                .id
+                .as_ref()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| format!("li_{}", Uuid::new_v4()));
+
+            let mut line_item = LineItemResponse {
+                id: line_item_id,
+                item: crate::models::ItemResponse {
+                    id: product.id,
+                    title: product.title,
+                    price: product.price,
+                    image_url: product.image_url,
+                    extra: item.item.extra.clone(),
+                },
+                quantity: item.quantity,
+                totals: Vec::new(),
+                parent_id: item.parent_id.clone(),
+                extra: item.extra.clone(),
+            };
+
+            self.update_line_item_totals(&mut line_item, 0);
+            line_items.push(line_item);
+        }
+
+        Ok(line_items)
+    }
+
+    fn update_line_item_totals(&self, line_item: &mut LineItemResponse, discount: i64) {
+        let subtotal = line_item.item.price * line_item.quantity as i64;
+        let mut totals = Vec::new();
+
+        totals.push(Total {
+            total_type: "subtotal".to_string(),
+            display_text: Some("Subtotal".to_string()),
+            amount: subtotal,
+        });
+
+        if discount > 0 {
+            totals.push(Total {
+                total_type: "items_discount".to_string(),
+                display_text: Some("Items discount".to_string()),
+                amount: discount,
+            });
+        }
+
+        totals.push(Total {
+            total_type: "total".to_string(),
+            display_text: Some("Total".to_string()),
+            amount: (subtotal - discount).max(0),
+        });
+
+        line_item.totals = totals;
+    }
+
+    fn apply_discounts(
+        &self,
+        line_items: &mut [LineItemResponse],
+        discounts: Option<DiscountsObject>,
+        fulfillment_cost: i64,
+    ) -> Result<DiscountOutcome, ServiceError> {
+        let Some(discounts) = discounts else {
+            return Ok(DiscountOutcome {
+                discounts: None,
+                items_discount: 0,
+                order_discount: 0,
+            });
+        };
+
+        let had_codes = discounts.codes.is_some();
+        let raw_codes = discounts.codes.unwrap_or_default();
+        let normalized_codes = raw_codes
+            .iter()
+            .map(|code| code.trim().to_uppercase())
+            .filter(|code| !code.is_empty())
+            .collect::<Vec<_>>();
+
+        let line_subtotals = line_items
+            .iter()
+            .map(|line_item| line_item.item.price * line_item.quantity as i64)
+            .collect::<Vec<_>>();
+
+        let mut per_item_discount = vec![0i64; line_items.len()];
+        let mut applied = Vec::new();
+        let mut order_discount = 0i64;
+        let mut seen_codes = HashSet::new();
+
+        for code in &normalized_codes {
+            if !seen_codes.insert(code.clone()) {
+                continue;
+            }
+
+            match code.as_str() {
+                "SAVE10" => {
+                    let mut allocations = Vec::new();
+                    let mut amount = 0i64;
+                    for (index, subtotal) in line_subtotals.iter().enumerate() {
+                        let discount = (subtotal * 10) / 100;
+                        if discount <= 0 {
+                            continue;
+                        }
+                        per_item_discount[index] += discount;
+                        amount += discount;
+                        allocations.push(DiscountAllocation {
+                            path: format!("$.line_items[{}]", index),
+                            amount: discount,
+                        });
+                    }
+
+                    if amount > 0 {
+                        applied.push(AppliedDiscount {
+                            code: Some(code.clone()),
+                            title: "Save 10%".to_string(),
+                            amount,
+                            automatic: Some(false),
+                            method: Some("across".to_string()),
+                            priority: Some(1),
+                            allocations: Some(allocations),
+                        });
+                    }
+                }
+                "SAVE5" => {
+                    let mut allocations = vec![0i64; line_items.len()];
+                    let available = line_subtotals
+                        .iter()
+                        .enumerate()
+                        .map(|(index, subtotal)| (subtotal - per_item_discount[index]).max(0))
+                        .collect::<Vec<_>>();
+                    let available_total: i64 = available.iter().sum();
+                    let mut discount_total = 500i64;
+                    if available_total <= 0 {
+                        continue;
+                    }
+                    if discount_total > available_total {
+                        discount_total = available_total;
+                    }
+
+                    let mut allocated = 0i64;
+                    for (index, value) in available.iter().enumerate() {
+                        if *value == 0 {
+                            continue;
+                        }
+                        let share = (discount_total * value) / available_total;
+                        allocations[index] = share;
+                        allocated += share;
+                    }
+
+                    let mut remainder = discount_total - allocated;
+                    if remainder > 0 {
+                        for (index, value) in available.iter().enumerate() {
+                            if *value > allocations[index] {
+                                let add = remainder.min(value - allocations[index]);
+                                allocations[index] += add;
+                                remainder -= add;
+                            }
+                            if remainder == 0 {
+                                break;
+                            }
+                        }
+                    }
+
+                    let mut applied_allocations = Vec::new();
+                    let mut amount = 0i64;
+                    for (index, value) in allocations.iter().enumerate() {
+                        if *value == 0 {
+                            continue;
+                        }
+                        per_item_discount[index] += *value;
+                        amount += *value;
+                        applied_allocations.push(DiscountAllocation {
+                            path: format!("$.line_items[{}]", index),
+                            amount: *value,
+                        });
+                    }
+
+                    if amount > 0 {
+                        applied.push(AppliedDiscount {
+                            code: Some(code.clone()),
+                            title: "Save $5".to_string(),
+                            amount,
+                            automatic: Some(false),
+                            method: Some("across".to_string()),
+                            priority: Some(2),
+                            allocations: Some(applied_allocations),
+                        });
+                    }
+                }
+                "SHIPFREE" => {
+                    let discount = fulfillment_cost.max(0);
+                    if discount > 0 {
+                        order_discount += discount;
+                        applied.push(AppliedDiscount {
+                            code: Some(code.clone()),
+                            title: "Free shipping".to_string(),
+                            amount: discount,
+                            automatic: Some(false),
+                            method: Some("across".to_string()),
+                            priority: Some(3),
+                            allocations: Some(vec![DiscountAllocation {
+                                path: "$.totals.fulfillment".to_string(),
+                                amount: discount,
+                            }]),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for (index, line_item) in line_items.iter_mut().enumerate() {
+            let discount = per_item_discount.get(index).copied().unwrap_or(0);
+            self.update_line_item_totals(line_item, discount);
+        }
+
+        let items_discount = per_item_discount.iter().sum();
+        let codes = if had_codes {
+            Some(normalized_codes)
+        } else {
+            None
+        };
+        let applied = if applied.is_empty() { None } else { Some(applied) };
+
+        Ok(DiscountOutcome {
+            discounts: if codes.is_some() || applied.is_some() {
+                Some(DiscountsObject { codes, applied })
+            } else {
+                None
+            },
+            items_discount,
+            order_discount,
+        })
+    }
+
+    fn calculate_totals(
+        &self,
+        line_items: &[LineItemResponse],
+        items_discount: i64,
+        fulfillment_cost: i64,
+        order_discount: i64,
+    ) -> Result<Vec<Total>, ServiceError> {
+        let subtotal: i64 = line_items
+            .iter()
+            .map(|line_item| line_item.item.price * line_item.quantity as i64)
+            .sum();
+
+        let mut totals = Vec::new();
+        totals.push(Total {
+            total_type: "subtotal".to_string(),
+            display_text: Some("Subtotal".to_string()),
+            amount: subtotal,
+        });
+
+        if items_discount > 0 {
+            totals.push(Total {
+                total_type: "items_discount".to_string(),
+                display_text: Some("Items discount".to_string()),
+                amount: items_discount,
+            });
+        }
+
+        if fulfillment_cost > 0 {
+            totals.push(Total {
+                total_type: "fulfillment".to_string(),
+                display_text: Some("Fulfillment".to_string()),
+                amount: fulfillment_cost,
+            });
+        }
+
+        if order_discount > 0 {
+            totals.push(Total {
+                total_type: "discount".to_string(),
+                display_text: Some("Discount".to_string()),
+                amount: order_discount,
+            });
+        }
+
+        let taxable_amount =
+            (subtotal - items_discount + fulfillment_cost - order_discount).max(0);
+        let tax = (taxable_amount * self.tax_bps) / 10_000;
+        if tax > 0 {
+            totals.push(Total {
+                total_type: "tax".to_string(),
+                display_text: Some("Tax".to_string()),
+                amount: tax,
+            });
+        }
+
+        let total = (taxable_amount + tax).max(0);
+        totals.push(Total {
+            total_type: "total".to_string(),
+            display_text: Some("Total".to_string()),
+            amount: total,
+        });
+
+        Ok(totals)
+    }
+
+    fn build_fulfillment(
+        &self,
+        fulfillment: Option<Fulfillment>,
+        line_items: &[LineItemResponse],
+    ) -> Result<(Option<Fulfillment>, i64), ServiceError> {
+        let Some(mut fulfillment) = fulfillment else {
+            return Ok((None, 0));
+        };
+
+        let line_item_ids = line_items
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+
+        let mut methods = fulfillment.methods.take().unwrap_or_else(|| {
+            vec![FulfillmentMethod {
+                id: Some(format!("fm_{}", Uuid::new_v4())),
+                method_type: "shipping".to_string(),
+                line_item_ids: line_item_ids.clone(),
+                destinations: None,
+                selected_destination_id: None,
+                groups: None,
+                extra: HashMap::new(),
+            }]
+        });
+
+        for method in &mut methods {
+            if method.id.as_deref().unwrap_or("").trim().is_empty() {
+                method.id = Some(format!("fm_{}", Uuid::new_v4()));
+            }
+            if method.method_type.trim().is_empty() {
+                method.method_type = "shipping".to_string();
+            }
+            if method.line_item_ids.is_empty()
+                || method
+                    .line_item_ids
+                    .iter()
+                    .any(|id| !line_item_ids.contains(id))
+            {
+                method.line_item_ids = line_item_ids.clone();
+            }
+
+            if let Some(destinations) = method.destinations.as_mut() {
+                for destination in destinations.iter_mut() {
+                    if destination.id.as_deref().unwrap_or("").trim().is_empty() {
+                        destination.id = Some(format!("dest_{}", Uuid::new_v4()));
+                    }
+                }
+            }
+
+            if method.selected_destination_id.is_none() {
+                if let Some(destinations) = method.destinations.as_ref() {
+                    if destinations.len() == 1 {
+                        method.selected_destination_id = destinations[0].id.clone();
+                    }
+                }
+            }
+
+            let mut groups = method.groups.take().unwrap_or_else(|| {
+                vec![FulfillmentGroup {
+                    id: Some(format!("grp_{}", Uuid::new_v4())),
+                    line_item_ids: method.line_item_ids.clone(),
+                    options: Some(self.default_fulfillment_options()),
+                    selected_option_id: None,
+                    extra: HashMap::new(),
+                }]
+            });
+
+            for group in &mut groups {
+                if group.id.as_deref().unwrap_or("").trim().is_empty() {
+                    group.id = Some(format!("grp_{}", Uuid::new_v4()));
+                }
+                if group.line_item_ids.is_empty()
+                    || group
+                        .line_item_ids
+                        .iter()
+                        .any(|id| !method.line_item_ids.contains(id))
+                {
+                    group.line_item_ids = method.line_item_ids.clone();
+                }
+                if group.options.is_none() {
+                    group.options = Some(self.default_fulfillment_options());
+                }
+                if let Some(options) = group.options.as_mut() {
+                    for (index, option) in options.iter_mut().enumerate() {
+                        if option.id.as_deref().unwrap_or("").trim().is_empty() {
+                            option.id = Some(format!("opt_{}", Uuid::new_v4()));
+                        }
+                        if option.title.as_deref().unwrap_or("").trim().is_empty() {
+                            option.title =
+                                Some(format!("Fulfillment Option {}", index + 1));
+                        }
+                        if option.totals.is_empty() {
+                            option.totals.push(Total {
+                                total_type: "total".to_string(),
+                                display_text: Some("Fulfillment".to_string()),
+                                amount: 0,
+                            });
+                        }
+                    }
+                }
+                if group.selected_option_id.is_none() {
+                    group.selected_option_id = group
+                        .options
+                        .as_ref()
+                        .and_then(|options| options.first().and_then(|option| option.id.clone()));
+                }
+            }
+
+            method.groups = Some(groups);
+        }
+
+        let available_methods = methods
+            .iter()
+            .map(|method| FulfillmentAvailableMethod {
+                id: method
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| format!("fm_{}", Uuid::new_v4())),
+                method_type: method.method_type.clone(),
+                line_item_ids: method.line_item_ids.clone(),
+                extra: HashMap::new(),
+            })
+            .collect::<Vec<_>>();
+
+        fulfillment.methods = Some(methods);
+        fulfillment.available_methods = Some(available_methods);
+
+        let fulfillment_total = self.selected_fulfillment_cost(&fulfillment);
+        Ok((Some(fulfillment), fulfillment_total))
+    }
+
+    fn default_fulfillment_options(&self) -> Vec<FulfillmentOption> {
+        let now = Utc::now();
+        let standard_total = 500;
+        let express_total = 1500;
+
+        vec![
+            FulfillmentOption {
+                id: Some("ship_standard".to_string()),
+                title: Some("Standard Shipping".to_string()),
+                description: Some("Arrives in 5-7 business days".to_string()),
+                carrier: Some("UPS".to_string()),
+                earliest_fulfillment_time: Some((now + ChronoDuration::days(5)).to_rfc3339()),
+                latest_fulfillment_time: Some((now + ChronoDuration::days(7)).to_rfc3339()),
+                totals: vec![Total {
+                    total_type: "total".to_string(),
+                    display_text: Some("Shipping".to_string()),
+                    amount: standard_total,
+                }],
+                extra: HashMap::new(),
+            },
+            FulfillmentOption {
+                id: Some("ship_express".to_string()),
+                title: Some("Express Shipping".to_string()),
+                description: Some("Arrives in 2-3 business days".to_string()),
+                carrier: Some("FedEx".to_string()),
+                earliest_fulfillment_time: Some((now + ChronoDuration::days(2)).to_rfc3339()),
+                latest_fulfillment_time: Some((now + ChronoDuration::days(3)).to_rfc3339()),
+                totals: vec![Total {
+                    total_type: "total".to_string(),
+                    display_text: Some("Shipping".to_string()),
+                    amount: express_total,
+                }],
+                extra: HashMap::new(),
+            },
+        ]
+    }
+
+    fn selected_fulfillment_cost(&self, fulfillment: &Fulfillment) -> i64 {
+        let Some(methods) = fulfillment.methods.as_ref() else {
+            return 0;
+        };
+
+        methods
+            .iter()
+            .flat_map(|method| method.groups.as_ref().into_iter().flatten())
+            .filter_map(|group| {
+                let options = group.options.as_ref()?;
+                let selected = group
+                    .selected_option_id
+                    .as_ref()
+                    .and_then(|id| options.iter().find(|option| option.id.as_ref() == Some(id)))
+                    .or_else(|| options.first());
+                selected.map(|option| self.fulfillment_option_total(option))
+            })
+            .sum()
+    }
+
+    fn fulfillment_option_total(&self, option: &FulfillmentOption) -> i64 {
+        option
+            .totals
+            .iter()
+            .find(|total| total.total_type == "total")
+            .map(|total| total.amount)
+            .unwrap_or_else(|| option.totals.iter().map(|total| total.amount).sum())
+    }
+
+    fn build_payment_response(
+        &self,
+        request: PaymentRequest,
+        existing: Option<PaymentResponse>,
+    ) -> PaymentResponse {
+        let mut payment = PaymentResponse {
+            handlers: self.handlers.clone(),
+            selected_instrument_id: request.selected_instrument_id,
+            instruments: request.instruments,
+            extra: request.extra,
+        };
+
+        if payment.selected_instrument_id.is_none() {
+            if let Some(existing_payment) = existing {
+                payment.selected_instrument_id = existing_payment.selected_instrument_id;
+                if payment.instruments.is_none() {
+                    payment.instruments = existing_payment.instruments;
+                }
+            }
+        }
+
+        payment
+    }
+
+    fn apply_status(&self, checkout: &mut CheckoutResponse) {
+        self.auto_select_instrument(&mut checkout.payment);
+        let mut messages = Vec::new();
+
+        if checkout
+            .buyer
+            .as_ref()
+            .and_then(|buyer| buyer.email.as_ref())
+            .is_none()
+        {
+            messages.push(Message {
+                message_type: "error".to_string(),
+                code: Some("missing".to_string()),
+                path: Some("$.buyer.email".to_string()),
+                content_type: Some("plain".to_string()),
+                content: "Buyer email is required".to_string(),
+                severity: Some("recoverable".to_string()),
+            });
+        }
+
+        if !self.has_selected_instrument(&checkout.payment) {
+            messages.push(Message {
+                message_type: "error".to_string(),
+                code: Some("missing_payment".to_string()),
+                path: Some("$.payment.selected_instrument_id".to_string()),
+                content_type: Some("plain".to_string()),
+                content: "A selected payment instrument is required".to_string(),
+                severity: Some("recoverable".to_string()),
+            });
+        }
+
+        if let Some(selected_id) = checkout.payment.selected_instrument_id.as_deref() {
+            if let Some(instruments) = checkout.payment.instruments.as_ref() {
+                if let Some((index, instrument)) = instruments
+                    .iter()
+                    .enumerate()
+                    .find(|(_, instrument)| instrument.id == selected_id)
+                {
+                    if instrument.instrument_type == "card" {
+                        let missing_brand = instrument
+                            .brand
+                            .as_deref()
+                            .map(|value| value.trim().is_empty())
+                            .unwrap_or(true);
+                        let missing_digits = instrument
+                            .last_digits
+                            .as_deref()
+                            .map(|value| value.trim().is_empty())
+                            .unwrap_or(true);
+                        if missing_brand || missing_digits {
+                            messages.push(Message {
+                                message_type: "error".to_string(),
+                                code: Some("missing".to_string()),
+                                path: Some(format!("$.payment.instruments[{}]", index)),
+                                content_type: Some("plain".to_string()),
+                                content: "Card payment instruments require brand and last_digits"
+                                    .to_string(),
+                                severity: Some("recoverable".to_string()),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(fulfillment) = checkout.fulfillment.as_ref() {
+            if let Some(methods) = fulfillment.methods.as_ref() {
+                for (index, method) in methods.iter().enumerate() {
+                    if method.method_type != "shipping" && method.method_type != "pickup" {
+                        messages.push(Message {
+                            message_type: "error".to_string(),
+                            code: Some("invalid".to_string()),
+                            path: Some(format!("$.fulfillment.methods[{}].type", index)),
+                            content_type: Some("plain".to_string()),
+                            content: "Fulfillment method type must be shipping or pickup"
+                                .to_string(),
+                            severity: Some("recoverable".to_string()),
+                        });
+                        continue;
+                    }
+
+                    if method.selected_destination_id.as_deref().unwrap_or("").is_empty() {
+                        messages.push(Message {
+                            message_type: "error".to_string(),
+                            code: Some("missing_destination".to_string()),
+                            path: Some(format!(
+                                "$.fulfillment.methods[{}].selected_destination_id",
+                                index
+                            )),
+                            content_type: Some("plain".to_string()),
+                            content: "Fulfillment destination is required".to_string(),
+                            severity: Some("requires_buyer_input".to_string()),
+                        });
+                        continue;
+                    }
+
+                    if method.method_type == "pickup" {
+                        let destinations = method.destinations.as_ref();
+                        let selected = destinations.and_then(|destinations| {
+                            let selected_id = method.selected_destination_id.as_ref()?;
+                            destinations
+                                .iter()
+                                .find(|dest| dest.id.as_ref() == Some(selected_id))
+                                .or_else(|| destinations.first())
+                        });
+                        if let Some(destination) = selected {
+                            let name = destination
+                                .data
+                                .get("name")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("")
+                                .trim();
+                            if name.is_empty() {
+                                messages.push(Message {
+                                    message_type: "error".to_string(),
+                                    code: Some("missing".to_string()),
+                                    path: Some(format!(
+                                        "$.fulfillment.methods[{}].destinations",
+                                        index
+                                    )),
+                                    content_type: Some("plain".to_string()),
+                                    content: "Pickup destinations require a name".to_string(),
+                                    severity: Some("recoverable".to_string()),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let requires_escalation = messages.iter().any(|message| {
+            matches!(
+                message.severity.as_deref(),
+                Some("requires_buyer_input") | Some("requires_buyer_review")
+            )
+        });
+
+        if messages.is_empty() {
+            checkout.status = CheckoutStatus::ReadyForComplete;
+            checkout.messages = None;
+            checkout.continue_url = None;
+        } else if requires_escalation {
+            checkout.status = CheckoutStatus::RequiresEscalation;
+            checkout.messages = Some(messages);
+            checkout.continue_url =
+                Some(format!("{}/checkout/{}", self.base_url, checkout.id));
+        } else {
+            checkout.status = CheckoutStatus::Incomplete;
+            checkout.messages = Some(messages);
+            checkout.continue_url = None;
+        }
+    }
+
+    fn has_selected_instrument(&self, payment: &PaymentResponse) -> bool {
+        let Some(selected_id) = payment.selected_instrument_id.as_deref() else {
+            return false;
+        };
+
+        let Some(instruments) = payment.instruments.as_ref() else {
+            return false;
+        };
+
+        instruments.iter().any(|instrument| instrument.id == selected_id)
+    }
+
+    fn auto_select_instrument(&self, payment: &mut PaymentResponse) {
+        if payment.selected_instrument_id.is_some() {
+            return;
+        }
+
+        if let Some(instruments) = payment.instruments.as_ref() {
+            if instruments.len() == 1 {
+                payment.selected_instrument_id = Some(instruments[0].id.clone());
+            }
+        }
+    }
+
+    fn attach_payment_data(
+        &self,
+        checkout: &mut CheckoutResponse,
+        payment_data: PaymentInstrument,
+    ) -> Result<(), ServiceError> {
+        if payment_data.id.trim().is_empty() {
+            return Err(ServiceError::InvalidInput(
+                "payment_data.id is required".to_string(),
+            ));
+        }
+
+        let payment = &mut checkout.payment;
+        let instruments = payment.instruments.get_or_insert_with(Vec::new);
+        if let Some(existing) = instruments
+            .iter_mut()
+            .find(|instrument| instrument.id == payment_data.id)
+        {
+            *existing = payment_data.clone();
+        } else {
+            instruments.push(payment_data.clone());
+        }
+
+        payment.selected_instrument_id = Some(payment_data.id);
+        Ok(())
+    }
+
+    fn expires_at(&self) -> String {
+        (Utc::now() + ChronoDuration::seconds(self.session_ttl_seconds as i64)).to_rfc3339()
+    }
+
+    fn build_order(&self, checkout: &CheckoutResponse, order_id: &str) -> Result<Order, ServiceError> {
+        let line_items = checkout
+            .line_items
+            .iter()
+            .map(|line_item| OrderLineItem {
+                id: line_item.id.clone(),
+                item: line_item.item.clone(),
+                quantity: OrderQuantity {
+                    total: line_item.quantity,
+                    fulfilled: 0,
+                },
+                totals: line_item.totals.clone(),
+                status: "processing".to_string(),
+                parent_id: line_item.parent_id.clone(),
+                extra: line_item.extra.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        Ok(Order {
+            ucp: self.order_meta(),
+            id: order_id.to_string(),
+            checkout_id: checkout.id.clone(),
+            permalink_url: format!("{}/orders/{}", self.base_url, order_id),
+            line_items,
+            fulfillment: self.build_order_fulfillment(checkout),
+            totals: checkout.totals.clone(),
+            adjustments: None,
+            extra: HashMap::new(),
+        })
+    }
+
+    fn build_order_fulfillment(&self, checkout: &CheckoutResponse) -> OrderFulfillment {
+        let Some(fulfillment) = checkout.fulfillment.as_ref() else {
+            return OrderFulfillment {
+                expectations: None,
+                events: None,
+            };
+        };
+
+        let Some(methods) = fulfillment.methods.as_ref() else {
+            return OrderFulfillment {
+                expectations: None,
+                events: None,
+            };
+        };
+
+        let mut expectations = Vec::new();
+        let mut events = Vec::new();
+
+        for method in methods {
+            let destination = self.selected_destination(method);
+            let Some(destination) = destination else {
+                continue;
+            };
+
+            let line_items = method
+                .line_item_ids
+                .iter()
+                .filter_map(|id| {
+                    checkout
+                        .line_items
+                        .iter()
+                        .find(|item| &item.id == id)
+                        .map(|item| {
+                            serde_json::json!({
+                                "id": item.id,
+                                "quantity": item.quantity,
+                            })
+                        })
+                })
+                .collect::<Vec<_>>();
+
+            if line_items.is_empty() {
+                continue;
+            }
+
+            let line_items_for_event = line_items.clone();
+
+            let description = self
+                .selected_option_for_method(method)
+                .and_then(|option| option.description.clone().or_else(|| option.title.clone()));
+
+            expectations.push(serde_json::json!({
+                "id": format!("exp_{}", Uuid::new_v4()),
+                "line_items": line_items,
+                "method_type": method.method_type.clone(),
+                "destination": destination,
+                "description": description,
+                "fulfillable_on": "now",
+            }));
+
+            events.push(serde_json::json!({
+                "id": format!("fev_{}", Uuid::new_v4()),
+                "occurred_at": Utc::now().to_rfc3339(),
+                "type": "processing",
+                "line_items": line_items_for_event,
+            }));
+        }
+
+        OrderFulfillment {
+            expectations: if expectations.is_empty() {
+                None
+            } else {
+                Some(expectations)
+            },
+            events: if events.is_empty() { None } else { Some(events) },
+        }
+    }
+
+    fn selected_destination(&self, method: &FulfillmentMethod) -> Option<serde_json::Value> {
+        let destinations = method.destinations.as_ref()?;
+        let selected = method
+            .selected_destination_id
+            .as_ref()
+            .and_then(|id| destinations.iter().find(|dest| dest.id.as_ref() == Some(id)))
+            .or_else(|| destinations.first())?;
+
+        if selected.data.is_empty() {
+            return None;
+        }
+
+        let mut map = serde_json::Map::new();
+        for (key, value) in &selected.data {
+            map.insert(key.clone(), value.clone());
+        }
+        Some(serde_json::Value::Object(map))
+    }
+
+    fn selected_option_for_method<'a>(
+        &self,
+        method: &'a FulfillmentMethod,
+    ) -> Option<&'a FulfillmentOption> {
+        let groups = method.groups.as_ref()?;
+        let group = groups.first()?;
+        let options = group.options.as_ref()?;
+
+        if let Some(selected_id) = group.selected_option_id.as_ref() {
+            if let Some(option) = options
+                .iter()
+                .find(|option| option.id.as_ref() == Some(selected_id))
+            {
+                return Some(option);
+            }
+        }
+
+        options.first()
+    }
+}

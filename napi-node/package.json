@@ -1,0 +1,51 @@
+{
+  "name": "@stateset/ucp-handler-node",
+  "version": "0.1.0",
+  "description": "Native Node.js bindings for the Stateset UCP Handler",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "napi": {
+    "name": "stateset-ucp",
+    "triples": {
+      "defaults": true,
+      "additional": [
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-gnu",
+        "aarch64-apple-darwin",
+        "aarch64-unknown-linux-musl"
+      ]
+    }
+  },
+  "license": "BUSL-1.1",
+  "files": [
+    "index.js",
+    "index.d.ts"
+  ],
+  "scripts": {
+    "artifacts": "napi artifacts",
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "prepublishOnly": "napi prepublish -t npm",
+    "test": "ava",
+    "universal": "napi universal",
+    "version": "napi version"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.0",
+    "ava": "^6.0.0"
+  },
+  "engines": {
+    "node": ">= 18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/stateset/stateset-ucp-handler"
+  },
+  "keywords": [
+    "napi-rs",
+    "stateset",
+    "ucp",
+    "checkout",
+    "commerce"
+  ]
+}

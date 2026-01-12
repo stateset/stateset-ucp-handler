@@ -1,0 +1,62 @@
+[workspace]
+members = [".", "napi-node"]
+resolver = "2"
+
+[package]
+name = "stateset-ucp-handler"
+version = "0.1.0"
+edition = "2021"
+description = "Universal Commerce Protocol (UCP) handler with checkout, crypto, MCP, and A2A support"
+license = "BUSL-1.1"
+repository = "https://github.com/stateset/stateset-ucp-handler"
+authors = ["Stateset <support@stateset.com>"]
+keywords = ["ucp", "commerce", "checkout", "payments", "mcp", "a2a"]
+categories = ["web-programming", "api-bindings"]
+readme = "README.md"
+
+[lib]
+name = "stateset_ucp_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "stateset-ucp-handler"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.7", features = ["json", "macros", "form"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+tower-http = { version = "0.5", features = ["cors", "compression-full", "trace", "limit"] }
+thiserror = "1"
+sha2 = "0.10"
+hex = "0.4"
+dotenvy = "0.15"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+base64 = "0.22"
+
+# Cryptographic dependencies for JWS/ECDSA
+p256 = { version = "0.13", features = ["ecdsa", "jwk"] }
+p384 = { version = "0.13", features = ["ecdsa", "jwk"] }
+ecdsa = { version = "0.16", features = ["signing", "verifying", "der"] }
+elliptic-curve = { version = "0.13", features = ["jwk"] }
+signature = "2.2"
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# RFC 8941 Structured Field Values for UCP-Agent header
+sfv = "0.9"
+
+# URL encoding for embedded protocol
+serde_urlencoded = "0.7"
+
+prost = "0.13"
+tonic = { version = "0.12", features = ["transport"] }
+tonic-health = "0.12"
+tonic-reflection = "0.12"
+
+[build-dependencies]
+tonic-build = "0.12"
