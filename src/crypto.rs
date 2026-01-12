@@ -12,7 +12,7 @@ use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey, Veri
 use p384::ecdsa::{Signature as P384Signature, SigningKey as P384SigningKey, VerifyingKey as P384VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha384};
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
 use thiserror::Error;
 
 use crate::models::JwkKey;
@@ -175,14 +175,11 @@ fn canonicalize_value(value: &serde_json::Value) -> String {
             format!("[{}]", items.join(","))
         }
         serde_json::Value::Object(obj) => {
-            // Sort keys lexicographically (RFC 8785 uses UTF-16 code unit ordering)
-            let mut sorted: BTreeMap<&String, &serde_json::Value> = BTreeMap::new();
-            for (k, v) in obj {
-                sorted.insert(k, v);
-            }
-            let pairs: Vec<String> = sorted
+            let mut keys = obj.keys().collect::<Vec<_>>();
+            keys.sort_by(|a, b| compare_utf16(a, b));
+            let pairs: Vec<String> = keys
                 .iter()
-                .map(|(k, v)| format!("{}:{}", canonicalize_string(k), canonicalize_value(v)))
+                .map(|k| format!("{}:{}", canonicalize_string(k), canonicalize_value(&obj[*k])))
                 .collect();
             format!("{{{}}}", pairs.join(","))
         }
@@ -205,14 +202,19 @@ fn canonicalize_number(n: &serde_json::Number) -> String {
         if f.is_infinite() || f.is_nan() {
             return "null".to_string(); // Not valid in JSON, but handle gracefully
         }
-        // Use shortest representation
-        let s = format!("{}", f);
-        // Remove trailing zeros after decimal point
-        if s.contains('.') && !s.contains('e') && !s.contains('E') {
-            let trimmed = s.trim_end_matches('0').trim_end_matches('.');
-            return trimmed.to_string();
+        let abs = f.abs();
+        let use_exponent = abs >= 1e21 || abs < 1e-6;
+        let raw = n.to_string();
+        if use_exponent {
+            if raw.contains('e') || raw.contains('E') {
+                return normalize_exponent(&raw);
+            }
+            return to_exponent(&raw);
         }
-        return s;
+        if raw.contains('e') || raw.contains('E') {
+            return expand_exponent(&raw);
+        }
+        return raw;
     }
     n.to_string()
 }
@@ -237,6 +239,132 @@ fn canonicalize_string(s: &str) -> String {
     }
     result.push('"');
     result
+}
+
+fn compare_utf16(a: &str, b: &str) -> Ordering {
+    let mut a_units = a.encode_utf16();
+    let mut b_units = b.encode_utf16();
+    loop {
+        match (a_units.next(), b_units.next()) {
+            (Some(left), Some(right)) => {
+                if left != right {
+                    return left.cmp(&right);
+                }
+            }
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (None, None) => return Ordering::Equal,
+        }
+    }
+}
+
+fn normalize_exponent(raw: &str) -> String {
+    let Some(pos) = raw.find(|c| c == 'e' || c == 'E') else {
+        return raw.to_string();
+    };
+    let (mantissa, exp_part) = raw.split_at(pos);
+    let exp_part = &exp_part[1..];
+    let (sign, digits) = if let Some(rest) = exp_part.strip_prefix('-') {
+        ('-', rest)
+    } else if let Some(rest) = exp_part.strip_prefix('+') {
+        ('+', rest)
+    } else {
+        ('+', exp_part)
+    };
+    let digits = digits.trim_start_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    format!("{mantissa}e{sign}{digits}")
+}
+
+fn expand_exponent(raw: &str) -> String {
+    let parsed = parse_number(raw);
+    let Some((negative, digits, decimal_pos, exponent)) = parsed else {
+        return raw.to_string();
+    };
+    let decimal_pos = decimal_pos + exponent;
+    let sign = if negative { "-" } else { "" };
+    let mut value = if decimal_pos <= 0 {
+        let zeros = "0".repeat((-decimal_pos) as usize);
+        format!("{sign}0.{zeros}{digits}")
+    } else if decimal_pos as usize >= digits.len() {
+        let zeros = "0".repeat(decimal_pos as usize - digits.len());
+        format!("{sign}{digits}{zeros}")
+    } else {
+        let pos = decimal_pos as usize;
+        let (left, right) = digits.split_at(pos);
+        format!("{sign}{left}.{right}")
+    };
+    if let Some(dot_pos) = value.find('.') {
+        while value.ends_with('0') {
+            value.pop();
+        }
+        if value.ends_with('.') && dot_pos == value.len() - 1 {
+            value.pop();
+        }
+    }
+    value
+}
+
+fn to_exponent(raw: &str) -> String {
+    let parsed = parse_number(raw);
+    let Some((negative, mut digits, mut decimal_pos, exponent)) = parsed else {
+        return raw.to_string();
+    };
+    decimal_pos += exponent;
+    while digits.starts_with('0') && digits.len() > 1 {
+        digits.remove(0);
+        decimal_pos -= 1;
+    }
+    while digits.ends_with('0') && digits.len() > 1 {
+        digits.pop();
+    }
+    if digits.is_empty() {
+        return "0".to_string();
+    }
+    let exp_value = decimal_pos - 1;
+    let sign = if negative { "-" } else { "" };
+    let (exp_sign, exp_digits) = if exp_value < 0 {
+        ('-', (-exp_value).to_string())
+    } else {
+        ('+', exp_value.to_string())
+    };
+    if digits.len() == 1 {
+        format!("{sign}{digits}e{exp_sign}{exp_digits}")
+    } else {
+        let (first, rest) = digits.split_at(1);
+        format!("{sign}{first}.{rest}e{exp_sign}{exp_digits}")
+    }
+}
+
+fn parse_number(raw: &str) -> Option<(bool, String, i32, i32)> {
+    let (base, exponent) = match raw.find(|c| c == 'e' || c == 'E') {
+        Some(pos) => {
+            let (left, right) = raw.split_at(pos);
+            let exponent: i32 = right[1..].parse().ok()?;
+            (left, exponent)
+        }
+        None => (raw, 0),
+    };
+    let mut base = base;
+    let mut negative = false;
+    if let Some(rest) = base.strip_prefix('-') {
+        negative = true;
+        base = rest;
+    } else if let Some(rest) = base.strip_prefix('+') {
+        base = rest;
+    }
+    let (digits, decimal_pos) = if let Some(dot_pos) = base.find('.') {
+        let mut digits = String::with_capacity(base.len() - 1);
+        digits.push_str(&base[..dot_pos]);
+        digits.push_str(&base[dot_pos + 1..]);
+        (digits, dot_pos as i32)
+    } else {
+        (base.to_string(), base.len() as i32)
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    Some((negative, digits, decimal_pos, exponent))
 }
 
 // ============================================================================
@@ -621,6 +749,20 @@ mod tests {
         assert_eq!(
             String::from_utf8(canonical).unwrap(),
             r#"{"a":[3,1,2],"z":{"a":1,"b":2}}"#
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_number_formatting() {
+        let value = serde_json::json!({
+            "small": 1e-7,
+            "edge": 1e-6,
+            "big": 1e21
+        });
+        let canonical = canonicalize(&value).unwrap();
+        assert_eq!(
+            String::from_utf8(canonical).unwrap(),
+            r#"{"big":1e+21,"edge":0.000001,"small":1e-7}"#
         );
     }
 

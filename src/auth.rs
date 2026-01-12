@@ -55,7 +55,7 @@ pub async fn auth_middleware(
     let api_key = extract_api_key(&headers);
     match api_key {
         Some(key) if auth.validate_token(&key).await => {
-            debug!("Authenticated request with key {}", key);
+            debug!("Authenticated request");
             next.run(request).await
         }
         Some(_) => {

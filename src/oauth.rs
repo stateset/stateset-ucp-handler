@@ -198,6 +198,7 @@ impl OAuthService {
         &self,
         request: AuthorizationRequest,
     ) -> Result<AuthorizationOutcome, OAuthError> {
+        self.cleanup_expired().await;
         if request.response_type != "code" {
             return Err(OAuthError::unsupported_response_type(
                 "response_type must be code",
@@ -234,6 +235,7 @@ impl OAuthService {
         client_id: &str,
         request: TokenRequest,
     ) -> Result<TokenResponse, OAuthError> {
+        self.cleanup_expired().await;
         if request.grant_type != "authorization_code" {
             return Err(OAuthError::unsupported_grant_type(
                 "grant_type must be authorization_code",
@@ -305,6 +307,17 @@ impl OAuthService {
         }
 
         true
+    }
+
+    async fn cleanup_expired(&self) {
+        {
+            let mut codes = self.codes.write().await;
+            codes.retain(|_, record| record.created_at.elapsed() <= self.config.code_ttl);
+        }
+        {
+            let mut tokens = self.tokens.write().await;
+            tokens.retain(|_, record| record.created_at.elapsed() <= self.config.token_ttl);
+        }
     }
 
     fn normalize_scopes(&self, scope: Option<&str>) -> Result<Vec<String>, OAuthError> {

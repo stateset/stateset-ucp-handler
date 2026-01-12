@@ -1,7 +1,7 @@
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::{header::CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, StatusCode},
+    http::{header::CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -54,8 +54,16 @@ impl IdempotencyStore {
         entries.insert(key, record);
     }
 
-    pub fn compute_hash(body: &[u8]) -> String {
+    pub fn compute_request_hash(method: &Method, uri: &Uri, body: &[u8]) -> String {
         let mut hasher = Sha256::new();
+        let path = uri
+            .path_and_query()
+            .map(|value| value.as_str())
+            .unwrap_or_else(|| uri.path());
+        hasher.update(method.as_str().as_bytes());
+        hasher.update(b" ");
+        hasher.update(path.as_bytes());
+        hasher.update(b"\n");
         hasher.update(body);
         hex::encode(hasher.finalize())
     }
@@ -72,7 +80,34 @@ pub async fn idempotency_middleware(
     };
 
     let idempotency_key = match headers.get("Idempotency-Key") {
-        Some(value) => value.to_str().unwrap_or_default().to_string(),
+        Some(value) => match value.to_str() {
+            Ok(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        axum::Json(serde_json::json!({
+                            "type": "invalid_request",
+                            "code": "invalid_idempotency_key",
+                            "message": "Idempotency-Key header must be a non-empty string"
+                        })),
+                    )
+                        .into_response();
+                }
+                trimmed.to_string()
+            }
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({
+                        "type": "invalid_request",
+                        "code": "invalid_idempotency_key",
+                        "message": "Idempotency-Key header must be valid ASCII"
+                    })),
+                )
+                    .into_response();
+            }
+        },
         None => return next.run(request).await,
     };
 
@@ -98,7 +133,7 @@ pub async fn idempotency_middleware(
         }
     };
 
-    let request_hash = IdempotencyStore::compute_hash(&body_bytes);
+    let request_hash = IdempotencyStore::compute_request_hash(&parts.method, &parts.uri, &body_bytes);
 
     if let Some(record) = store.get(&idempotency_key).await {
         if record.request_hash != request_hash {

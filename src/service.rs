@@ -308,6 +308,12 @@ impl CheckoutService {
         }
 
         self.attach_payment_data(&mut checkout, request.payment_data)?;
+        self.apply_status(&mut checkout);
+        if !matches!(checkout.status, CheckoutStatus::ReadyForComplete) {
+            return Err(ServiceError::InvalidState(
+                "Checkout session is not ready for completion".to_string(),
+            ));
+        }
 
         let order_id = format!("order_{}", Uuid::new_v4());
         let order = self.build_order(&checkout, &order_id)?;

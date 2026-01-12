@@ -304,19 +304,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // MCP JSON-RPC transport
     let mcp_router = Router::new()
-        .route("/mcp", post(mcp_handler_endpoint))
+        .route(
+            "/mcp",
+            post(mcp_handler_endpoint)
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    idempotency_middleware,
+                ))
+                .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    require_headers_middleware,
+                )),
+        )
         .route("/schemas/shopping/mcp.openrpc.json", get(mcp_schema));
     app = app.merge(mcp_router);
 
     // A2A (Agent-to-Agent) transport
     let a2a_router = Router::new()
         .route("/.well-known/agent-card.json", get(agent_card))
-        .route("/a2a", post(a2a_handler_endpoint));
+        .route(
+            "/a2a",
+            post(a2a_handler_endpoint)
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    idempotency_middleware,
+                ))
+                .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    require_headers_middleware,
+                )),
+        );
     app = app.merge(a2a_router);
 
     // Embedded Protocol
-    let embedded_router = Router::new()
-        .route("/checkout/:id/embedded", get(embedded_checkout));
+    let embedded_router = Router::new().route(
+        "/checkout/:id/embedded",
+        get(embedded_checkout)
+            .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_headers_middleware,
+            )),
+    );
     app = app.merge(embedded_router);
 
     let grpc_state = state.clone();
