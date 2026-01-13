@@ -2,6 +2,8 @@
 // Used by bindings/napi-node and other consumers
 
 pub mod a2a;
+pub mod commerce;
+pub mod commerce_adapter;
 pub mod auth;
 pub mod catalog;
 pub mod config;

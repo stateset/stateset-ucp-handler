@@ -7,7 +7,7 @@ name = "stateset-ucp-handler"
 version = "0.1.0"
 edition = "2021"
 description = "Universal Commerce Protocol (UCP) handler with checkout, crypto, MCP, and A2A support"
-license = "BUSL-1.1"
+license = "MIT or Apache-2.0"
 repository = "https://github.com/stateset/stateset-ucp-handler"
 authors = ["Stateset <support@stateset.com>"]
 keywords = ["ucp", "commerce", "checkout", "payments", "mcp", "a2a"]
@@ -57,6 +57,12 @@ prost = "0.13"
 tonic = { version = "0.12", features = ["transport"] }
 tonic-health = "0.12"
 tonic-reflection = "0.12"
+
+# StateSet iCommerce - embedded commerce engine (from crates.io)
+stateset-embedded = { version = "0.2.0", features = ["sqlite", "events"] }
+stateset-core = "0.2.0"
+rust_decimal = { version = "1.36", features = ["serde"] }
+rust_decimal_macros = "1.36"
 
 [build-dependencies]
 tonic-build = "0.12"

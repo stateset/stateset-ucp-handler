@@ -16,6 +16,8 @@ use tracing::{info, warn};
 mod a2a;
 mod auth;
 mod catalog;
+mod commerce;
+mod commerce_adapter;
 mod config;
 mod constants;
 mod crypto;
@@ -130,8 +132,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .json()
         .init();
 
-    let store = CheckoutStore::new();
-    let catalog = catalog::ProductCatalog::new();
+    // Initialize iCommerce engine if enabled
+    let commerce_engine = if config.commerce_enabled {
+        match commerce::CommerceEngine::new(&config.commerce_db_path) {
+            Ok(engine) => {
+                info!("iCommerce engine initialized at {}", config.commerce_db_path);
+                Some(engine)
+            }
+            Err(e) => {
+                warn!("Failed to initialize iCommerce engine: {}. Falling back to in-memory stores.", e);
+                None
+            }
+        }
+    } else {
+        info!("iCommerce engine disabled, using in-memory stores");
+        None
+    };
+
+    // Create stores with iCommerce backend when available
+    let store = match &commerce_engine {
+        Some(engine) => CheckoutStore::new_with_commerce(engine.clone()),
+        None => CheckoutStore::new(),
+    };
+    let catalog = match &commerce_engine {
+        Some(engine) => catalog::ProductCatalog::new_with_commerce(engine.clone()),
+        None => catalog::ProductCatalog::new(),
+    };
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(128);
     let event_sender = EventSender::new(event_tx);
@@ -185,6 +211,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service = CheckoutService::new(
         store,
         catalog,
+        commerce_engine.clone(),
         event_sender.clone(),
         config.ucp_version.clone(),
         config.service_version.clone(),

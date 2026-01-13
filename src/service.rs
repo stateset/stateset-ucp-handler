@@ -67,6 +67,7 @@ struct DiscountOutcome {
 pub struct CheckoutService {
     store: CheckoutStore,
     catalog: ProductCatalog,
+    commerce: Option<crate::commerce::CommerceEngine>,
     event_sender: EventSender,
     ucp_version: String,
     service_version: String,
@@ -88,6 +89,7 @@ impl CheckoutService {
     pub fn new(
         store: CheckoutStore,
         catalog: ProductCatalog,
+        commerce: Option<crate::commerce::CommerceEngine>,
         event_sender: EventSender,
         ucp_version: String,
         service_version: String,
@@ -130,6 +132,7 @@ impl CheckoutService {
         Self {
             store,
             catalog,
+            commerce,
             event_sender,
             ucp_version,
             service_version,
@@ -162,7 +165,7 @@ impl CheckoutService {
         let currency = normalize_currency(&request.currency)?;
         let mut line_items = self.build_line_items(&request.line_items, &currency)?;
         let (fulfillment, fulfillment_cost) =
-            self.build_fulfillment(request.fulfillment, &line_items)?;
+            self.build_fulfillment(request.fulfillment, &line_items, None)?;
         let discount_outcome =
             self.apply_discounts(&mut line_items, request.discounts, fulfillment_cost)?;
         let totals = self.calculate_totals(
@@ -244,7 +247,7 @@ impl CheckoutService {
 
         let fulfillment_input = request.fulfillment.or(existing_fulfillment);
         let (fulfillment, fulfillment_cost) =
-            self.build_fulfillment(fulfillment_input, &line_items)?;
+            self.build_fulfillment(fulfillment_input, &line_items, Some(checkout_id))?;
 
         let discount_input = request.discounts.or(existing_discounts);
         let discount_outcome =
@@ -724,6 +727,156 @@ impl CheckoutService {
             .filter(|code| !code.is_empty())
             .collect::<Vec<_>>();
 
+        // Try iCommerce Promotions first if available
+        if let Some(ref commerce) = self.commerce {
+            if let Some(result) = self.try_icommerce_promotions(
+                commerce,
+                line_items,
+                &normalized_codes,
+                fulfillment_cost,
+            )? {
+                return Ok(result);
+            }
+            // Fall through to legacy codes if iCommerce didn't match
+        }
+
+        // Legacy hardcoded discount codes
+        self.apply_legacy_discounts(line_items, &normalized_codes, fulfillment_cost, had_codes)
+    }
+
+    /// Try to apply discounts via iCommerce Promotions API
+    fn try_icommerce_promotions(
+        &self,
+        commerce: &crate::commerce::CommerceEngine,
+        line_items: &mut [LineItemResponse],
+        codes: &[String],
+        fulfillment_cost: i64,
+    ) -> Result<Option<DiscountOutcome>, ServiceError> {
+        use crate::commerce_adapter::{cents_to_decimal, decimal_to_cents};
+        use stateset_embedded::{ApplyPromotionsRequest, PromotionLineItem, PromotionTarget};
+
+        if codes.is_empty() {
+            return Ok(None);
+        }
+
+        // Build promotion request
+        let subtotal: i64 = line_items
+            .iter()
+            .map(|li| li.item.price * li.quantity as i64)
+            .sum();
+
+        let promo_line_items: Vec<PromotionLineItem> = line_items
+            .iter()
+            .map(|li| PromotionLineItem {
+                id: li.id.clone(),
+                product_id: None,
+                variant_id: None,
+                sku: Some(li.item.id.clone()),
+                category_ids: vec![],
+                quantity: li.quantity,
+                unit_price: cents_to_decimal(li.item.price),
+                line_total: cents_to_decimal(li.item.price * li.quantity as i64),
+            })
+            .collect();
+
+        let request = ApplyPromotionsRequest {
+            cart_id: None,
+            customer_id: None,
+            coupon_codes: codes.to_vec(),
+            line_items: promo_line_items,
+            subtotal: cents_to_decimal(subtotal),
+            shipping_amount: cents_to_decimal(fulfillment_cost),
+            shipping_country: None,
+            shipping_state: None,
+            currency: "USD".to_string(),
+            is_first_order: false,
+        };
+
+        let result = commerce.promotions().apply(request);
+
+        match result {
+            Ok(promo_result) => {
+                // Check if any promotions were applied
+                if promo_result.applied_promotions.is_empty() {
+                    return Ok(None); // Fall back to legacy codes
+                }
+
+                // Convert iCommerce result to UCP DiscountOutcome
+                let mut items_discount = 0i64;
+                let mut order_discount = 0i64;
+                let mut per_item_discount = vec![0i64; line_items.len()];
+
+                let applied: Vec<AppliedDiscount> = promo_result
+                    .applied_promotions
+                    .iter()
+                    .map(|promo| {
+                        let amount = decimal_to_cents(promo.discount_amount);
+
+                        // Determine discount target
+                        match promo.target {
+                            PromotionTarget::LineItem | PromotionTarget::Product | PromotionTarget::Category => {
+                                items_discount += amount;
+                            }
+                            PromotionTarget::Order | PromotionTarget::Shipping => {
+                                order_discount += amount;
+                            }
+                        }
+
+                        AppliedDiscount {
+                            code: promo.coupon_code.clone(),
+                            title: promo.promotion_name.clone(),
+                            amount,
+                            automatic: Some(promo.coupon_code.is_none()),
+                            method: Some("across".to_string()),
+                            priority: None,
+                            allocations: None, // iCommerce doesn't provide per-item allocations in this structure
+                        }
+                    })
+                    .collect();
+
+                // Apply per-line-item discounts from iCommerce
+                for lid in &promo_result.line_item_discounts {
+                    if let Some(index) = line_items.iter().position(|li| li.id == lid.line_item_id) {
+                        per_item_discount[index] += decimal_to_cents(lid.discount_amount);
+                    }
+                }
+
+                // Update line item totals
+                for (index, line_item) in line_items.iter_mut().enumerate() {
+                    let discount = per_item_discount.get(index).copied().unwrap_or(0);
+                    self.update_line_item_totals(line_item, discount);
+                }
+
+                let codes_vec = if codes.is_empty() {
+                    None
+                } else {
+                    Some(codes.to_vec())
+                };
+
+                Ok(Some(DiscountOutcome {
+                    discounts: Some(DiscountsObject {
+                        codes: codes_vec,
+                        applied: Some(applied),
+                    }),
+                    items_discount,
+                    order_discount,
+                }))
+            }
+            Err(e) => {
+                tracing::warn!("iCommerce promotions error: {}, falling back to legacy codes", e);
+                Ok(None) // Fall back to legacy codes
+            }
+        }
+    }
+
+    /// Apply legacy hardcoded discount codes (SAVE10, SAVE5, SHIPFREE)
+    fn apply_legacy_discounts(
+        &self,
+        line_items: &mut [LineItemResponse],
+        normalized_codes: &[String],
+        fulfillment_cost: i64,
+        had_codes: bool,
+    ) -> Result<DiscountOutcome, ServiceError> {
         let line_subtotals = line_items
             .iter()
             .map(|line_item| line_item.item.price * line_item.quantity as i64)
@@ -734,7 +887,7 @@ impl CheckoutService {
         let mut order_discount = 0i64;
         let mut seen_codes = HashSet::new();
 
-        for code in &normalized_codes {
+        for code in normalized_codes {
             if !seen_codes.insert(code.clone()) {
                 continue;
             }
@@ -863,7 +1016,7 @@ impl CheckoutService {
 
         let items_discount = per_item_discount.iter().sum();
         let codes = if had_codes {
-            Some(normalized_codes)
+            Some(normalized_codes.to_vec())
         } else {
             None
         };
@@ -925,7 +1078,9 @@ impl CheckoutService {
 
         let taxable_amount =
             (subtotal - items_discount + fulfillment_cost - order_discount).max(0);
-        let tax = (taxable_amount * self.tax_bps) / 10_000;
+
+        // Try iCommerce Tax API first, fall back to fixed rate
+        let tax = self.calculate_tax(line_items, taxable_amount);
         if tax > 0 {
             totals.push(Total {
                 total_type: "tax".to_string(),
@@ -944,10 +1099,86 @@ impl CheckoutService {
         Ok(totals)
     }
 
+    /// Calculate tax using iCommerce Tax API or fallback to fixed rate
+    fn calculate_tax(&self, line_items: &[LineItemResponse], taxable_amount: i64) -> i64 {
+        // Try iCommerce Tax API if available
+        if let Some(ref commerce) = self.commerce {
+            if let Some(tax) = self.try_icommerce_tax(commerce, line_items) {
+                return tax;
+            }
+        }
+
+        // Fallback to fixed rate
+        (taxable_amount * self.tax_bps) / 10_000
+    }
+
+    /// Try to calculate tax using iCommerce Tax API
+    fn try_icommerce_tax(
+        &self,
+        commerce: &crate::commerce::CommerceEngine,
+        line_items: &[LineItemResponse],
+    ) -> Option<i64> {
+        use crate::commerce_adapter::{cents_to_decimal, decimal_to_cents};
+        use rust_decimal::Decimal;
+        use stateset_embedded::{ProductTaxCategory, TaxAddress, TaxCalculationRequest, TaxLineItem};
+
+        // Build tax calculation request
+        let tax_line_items: Vec<TaxLineItem> = line_items
+            .iter()
+            .map(|li| TaxLineItem {
+                id: li.id.clone(),
+                quantity: Decimal::from(li.quantity),
+                unit_price: cents_to_decimal(li.item.price),
+                tax_category: ProductTaxCategory::Standard,
+                sku: Some(li.item.id.clone()),
+                product_id: None,
+                tax_code: None,
+                description: None,
+                discount_amount: Decimal::ZERO,
+            })
+            .collect();
+
+        // For now, use a default address. In production, this would come from fulfillment.
+        // The address-based tax will be more accurate when shipping address is available.
+        let request = TaxCalculationRequest {
+            line_items: tax_line_items,
+            shipping_address: TaxAddress {
+                country: "US".to_string(),
+                state: None,
+                city: None,
+                postal_code: None,
+                line1: None,
+                line2: None,
+            },
+            billing_address: None,
+            shipping_amount: None,
+            customer_id: None,
+            transaction_date: None,
+            currency: "USD".to_string(),
+            prices_include_tax: false,
+        };
+
+        match commerce.tax().calculate(request) {
+            Ok(result) => {
+                let tax_cents = decimal_to_cents(result.total_tax);
+                if tax_cents > 0 {
+                    Some(tax_cents)
+                } else {
+                    None // Fall back to fixed rate
+                }
+            }
+            Err(e) => {
+                tracing::debug!("iCommerce tax calculation error: {}, using fallback rate", e);
+                None // Fall back to fixed rate
+            }
+        }
+    }
+
     fn build_fulfillment(
         &self,
         fulfillment: Option<Fulfillment>,
         line_items: &[LineItemResponse],
+        checkout_id: Option<&str>,
     ) -> Result<(Option<Fulfillment>, i64), ServiceError> {
         let Some(mut fulfillment) = fulfillment else {
             return Ok((None, 0));
@@ -1006,7 +1237,7 @@ impl CheckoutService {
                 vec![FulfillmentGroup {
                     id: Some(format!("grp_{}", Uuid::new_v4())),
                     line_item_ids: method.line_item_ids.clone(),
-                    options: Some(self.default_fulfillment_options()),
+                    options: Some(self.get_fulfillment_options(checkout_id)),
                     selected_option_id: None,
                     extra: HashMap::new(),
                 }]
@@ -1025,7 +1256,7 @@ impl CheckoutService {
                     group.line_item_ids = method.line_item_ids.clone();
                 }
                 if group.options.is_none() {
-                    group.options = Some(self.default_fulfillment_options());
+                    group.options = Some(self.get_fulfillment_options(checkout_id));
                 }
                 if let Some(options) = group.options.as_mut() {
                     for (index, option) in options.iter_mut().enumerate() {
@@ -1076,6 +1307,70 @@ impl CheckoutService {
         Ok((Some(fulfillment), fulfillment_total))
     }
 
+    fn get_fulfillment_options(&self, checkout_id: Option<&str>) -> Vec<FulfillmentOption> {
+        // Try iCommerce shipping rates first
+        if let Some(ref commerce) = self.commerce {
+            if let Some(id) = checkout_id {
+                if let Some(options) = self.try_icommerce_shipping_rates(commerce, id) {
+                    if !options.is_empty() {
+                        return options;
+                    }
+                }
+            }
+        }
+
+        // Fallback to default hardcoded options
+        self.default_fulfillment_options()
+    }
+
+    /// Try to get shipping rates from iCommerce
+    fn try_icommerce_shipping_rates(
+        &self,
+        commerce: &crate::commerce::CommerceEngine,
+        checkout_id: &str,
+    ) -> Option<Vec<FulfillmentOption>> {
+        use crate::commerce_adapter::{decimal_to_cents, parse_checkout_id};
+
+        let cart_id = parse_checkout_id(checkout_id)?;
+
+        let rates = commerce.carts().get_shipping_rates(cart_id).ok()?;
+
+        if rates.is_empty() {
+            return None;
+        }
+
+        let now = Utc::now();
+        let options: Vec<FulfillmentOption> = rates
+            .into_iter()
+            .map(|rate| {
+                let estimated_days = rate.estimated_days.unwrap_or(5);
+                let earliest = rate
+                    .estimated_delivery
+                    .unwrap_or_else(|| now + ChronoDuration::days(estimated_days as i64));
+
+                FulfillmentOption {
+                    id: Some(rate.id),
+                    title: Some(format!("{} {}", rate.carrier, rate.service)),
+                    description: rate.description,
+                    carrier: Some(rate.carrier),
+                    earliest_fulfillment_time: Some(earliest.to_rfc3339()),
+                    latest_fulfillment_time: Some(
+                        (earliest + ChronoDuration::days(2)).to_rfc3339(),
+                    ),
+                    totals: vec![Total {
+                        total_type: "total".to_string(),
+                        display_text: Some("Shipping".to_string()),
+                        amount: decimal_to_cents(rate.price),
+                    }],
+                    extra: HashMap::new(),
+                }
+            })
+            .collect();
+
+        Some(options)
+    }
+
+    /// Default hardcoded fulfillment options (fallback when iCommerce unavailable)
     fn default_fulfillment_options(&self) -> Vec<FulfillmentOption> {
         let now = Utc::now();
         let standard_total = 500;

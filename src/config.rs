@@ -38,6 +38,18 @@ pub struct Config {
     pub token_single_use: bool,
     pub require_ucp_agent: bool,
     pub require_request_signature: bool,
+
+    // iCommerce engine configuration
+    /// Enable iCommerce as the execution backend (default: true)
+    pub commerce_enabled: bool,
+    /// Path to SQLite database for commerce persistence (default: ./commerce.db)
+    pub commerce_db_path: String,
+    /// Use iCommerce for tax calculation instead of fixed rate (default: true when commerce enabled)
+    pub use_icommerce_tax: bool,
+    /// Use iCommerce for promotions instead of hardcoded codes (default: true when commerce enabled)
+    pub use_icommerce_promotions: bool,
+    /// Use iCommerce for shipping rates instead of hardcoded options (default: true when commerce enabled)
+    pub use_icommerce_shipping: bool,
 }
 
 impl Config {
@@ -184,6 +196,30 @@ impl Config {
             .map(|value| value == "true" || value == "1")
             .unwrap_or(true);
 
+        // iCommerce configuration
+        let commerce_enabled = std::env::var("COMMERCE_ENABLED")
+            .ok()
+            .map(|value| value == "true" || value == "1")
+            .unwrap_or(true); // Enabled by default
+
+        let commerce_db_path = std::env::var("COMMERCE_DB_PATH")
+            .unwrap_or_else(|_| "./commerce.db".to_string());
+
+        let use_icommerce_tax = std::env::var("USE_ICOMMERCE_TAX")
+            .ok()
+            .map(|value| value == "true" || value == "1")
+            .unwrap_or(commerce_enabled);
+
+        let use_icommerce_promotions = std::env::var("USE_ICOMMERCE_PROMOTIONS")
+            .ok()
+            .map(|value| value == "1" || value == "true")
+            .unwrap_or(commerce_enabled);
+
+        let use_icommerce_shipping = std::env::var("USE_ICOMMERCE_SHIPPING")
+            .ok()
+            .map(|value| value == "true" || value == "1")
+            .unwrap_or(commerce_enabled);
+
         Ok(Self {
             host,
             port,
@@ -221,6 +257,11 @@ impl Config {
             token_single_use,
             require_ucp_agent,
             require_request_signature,
+            commerce_enabled,
+            commerce_db_path,
+            use_icommerce_tax,
+            use_icommerce_promotions,
+            use_icommerce_shipping,
         })
     }
 }

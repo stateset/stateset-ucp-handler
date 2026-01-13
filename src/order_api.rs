@@ -4,12 +4,17 @@
 //! - Order retrieval
 //! - Fulfillment event tracking
 //! - Order adjustments (refunds, returns, credits)
+//!
+//! Hybrid storage using iCommerce Orders for persistence and in-memory cache
+//! for UCP-specific metadata that doesn't map directly to iCommerce Order fields.
 
 // Public API for order lifecycle management - used by consumers of this crate
 #![allow(dead_code)]
 
+use crate::commerce::CommerceEngine;
+use crate::commerce_adapter::{decimal_to_cents, parse_order_id};
 use crate::errors::ServiceError;
-use crate::models::{Order, UcpResponseMeta, CapabilityRef};
+use crate::models::{Order, UcpResponseMeta, CapabilityRef, OrderLineItem, OrderQuantity, Total, ItemResponse, OrderFulfillment};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -17,32 +22,250 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-/// Order storage with in-memory persistence
+/// Hybrid order storage with iCommerce persistence and in-memory cache
 #[derive(Clone)]
 pub struct OrderStore {
+    /// iCommerce engine for order persistence
+    commerce: Option<CommerceEngine>,
+    /// In-memory cache for UCP Order objects
     orders: Arc<RwLock<HashMap<String, Order>>>,
 }
 
 impl OrderStore {
-    pub fn new() -> Self {
+    /// Create a new OrderStore with iCommerce backend
+    pub fn new_with_commerce(commerce: CommerceEngine) -> Self {
         Self {
+            commerce: Some(commerce),
             orders: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
+    /// Create an in-memory only store (for testing or legacy mode)
+    pub fn new() -> Self {
+        Self {
+            commerce: None,
+            orders: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Insert an order into the store
+    ///
+    /// Stores in cache and syncs to iCommerce for persistence
     pub async fn insert(&self, order: Order) {
-        let mut orders = self.orders.write().await;
-        orders.insert(order.id.clone(), order);
+        let order_id = order.id.clone();
+
+        // Store in cache
+        {
+            let mut orders = self.orders.write().await;
+            orders.insert(order_id.clone(), order.clone());
+        }
+
+        // Sync to iCommerce if available
+        if let Some(ref commerce) = self.commerce {
+            if let Err(e) = self.sync_to_icommerce(commerce, &order) {
+                tracing::warn!("Failed to sync order to iCommerce: {}", e);
+            }
+        }
     }
 
+    /// Get an order by ID
+    ///
+    /// First checks cache, then falls back to iCommerce
     pub async fn get(&self, order_id: &str) -> Option<Order> {
-        let orders = self.orders.read().await;
-        orders.get(order_id).cloned()
+        // Fast path: check cache
+        {
+            let orders = self.orders.read().await;
+            if let Some(order) = orders.get(order_id) {
+                return Some(order.clone());
+            }
+        }
+
+        // Slow path: try iCommerce
+        if let Some(ref commerce) = self.commerce {
+            if let Some(order) = self.load_from_icommerce(commerce, order_id) {
+                // Re-populate cache
+                let mut orders = self.orders.write().await;
+                orders.insert(order_id.to_string(), order.clone());
+                return Some(order);
+            }
+        }
+
+        None
     }
 
+    /// Update an order in the store
     pub async fn update(&self, order: Order) {
-        let mut orders = self.orders.write().await;
-        orders.insert(order.id.clone(), order);
+        let order_id = order.id.clone();
+
+        // Update cache
+        {
+            let mut orders = self.orders.write().await;
+            orders.insert(order_id.clone(), order.clone());
+        }
+
+        // Sync to iCommerce if available
+        if let Some(ref commerce) = self.commerce {
+            if let Err(e) = self.update_icommerce_order(commerce, &order) {
+                tracing::warn!("Failed to update order in iCommerce: {}", e);
+            }
+        }
+    }
+
+    /// Sync UCP order to iCommerce
+    fn sync_to_icommerce(&self, commerce: &CommerceEngine, order: &Order) -> Result<(), String> {
+        use stateset_embedded::{CreateOrder, CreateOrderItem};
+
+        // Parse order ID to UUID
+        let uuid = parse_order_id(&order.id)
+            .ok_or_else(|| "Invalid order ID format".to_string())?;
+
+        // Check if order already exists
+        if commerce.orders().get(uuid).map_err(|e| e.to_string())?.is_some() {
+            // Order exists, update it
+            return self.update_icommerce_order(commerce, order);
+        }
+
+        // Build order items
+        // Note: iCommerce requires product_id as Uuid, we use nil() as placeholder
+        // since UCP line items may not have a product_id
+        let items: Vec<CreateOrderItem> = order.line_items.iter().map(|li| {
+            CreateOrderItem {
+                product_id: Uuid::nil(), // UCP doesn't require product_id
+                variant_id: None,
+                sku: li.item.id.clone(),
+                name: li.item.title.clone(),
+                quantity: li.quantity.total,
+                unit_price: crate::commerce_adapter::cents_to_decimal(li.item.price),
+                discount: None,
+                tax_amount: None,
+            }
+        }).collect();
+
+        // Create order in iCommerce
+        // Note: iCommerce requires a customer_id, we use nil() as placeholder
+        let create_request = CreateOrder {
+            customer_id: Uuid::nil(), // UCP orders may not have customer_id
+            items,
+            currency: Some("USD".to_string()),
+            notes: None,
+            shipping_address: None,
+            billing_address: None,
+            payment_method: None,
+            shipping_method: None,
+        };
+
+        match commerce.orders().create(create_request) {
+            Ok(_created) => Ok(()),
+            Err(e) => {
+                tracing::debug!("Could not create order in iCommerce: {}", e);
+                Ok(()) // Not a fatal error - we have the cache
+            }
+        }
+    }
+
+    /// Update an existing order in iCommerce
+    fn update_icommerce_order(&self, commerce: &CommerceEngine, order: &Order) -> Result<(), String> {
+        use stateset_embedded::{UpdateOrder, FulfillmentStatus as IcFulfillmentStatus};
+
+        let uuid = parse_order_id(&order.id)
+            .ok_or_else(|| "Invalid order ID format".to_string())?;
+
+        // Map UCP fulfillment status to iCommerce status
+        let fulfillment_status = if order.line_items.iter().all(|li| li.status == "fulfilled") {
+            Some(IcFulfillmentStatus::Fulfilled)
+        } else if order.line_items.iter().any(|li| li.status == "partial") {
+            Some(IcFulfillmentStatus::PartiallyFulfilled)
+        } else {
+            None
+        };
+
+        // Extract tracking number from fulfillment events
+        let tracking_number = order.fulfillment.events.as_ref().and_then(|events| {
+            events.iter().filter_map(|e| {
+                e.get("tracking_number").and_then(|v| v.as_str()).map(|s| s.to_string())
+            }).last()
+        });
+
+        let update = UpdateOrder {
+            fulfillment_status,
+            tracking_number,
+            ..Default::default()
+        };
+
+        commerce.orders().update(uuid, update)
+            .map_err(|e| e.to_string())?;
+
+        Ok(())
+    }
+
+    /// Load order from iCommerce and convert to UCP format
+    fn load_from_icommerce(&self, commerce: &CommerceEngine, order_id: &str) -> Option<Order> {
+        let uuid = parse_order_id(order_id)?;
+        let ic_order = commerce.orders().get(uuid).ok()??;
+
+        // Convert iCommerce order to UCP Order
+        let line_items: Vec<OrderLineItem> = ic_order.items.iter().map(|item| {
+            // Determine fulfilled quantity based on order fulfillment status
+            let fulfilled_qty = match ic_order.fulfillment_status {
+                stateset_embedded::FulfillmentStatus::Fulfilled => item.quantity,
+                stateset_embedded::FulfillmentStatus::PartiallyFulfilled => item.quantity / 2, // Estimate
+                _ => 0,
+            };
+
+            OrderLineItem {
+                id: format!("li_{}", item.id),
+                item: ItemResponse {
+                    id: item.sku.clone(),
+                    title: item.name.clone(),
+                    price: decimal_to_cents(item.unit_price),
+                    image_url: None, // iCommerce OrderItem doesn't have image_url
+                    extra: HashMap::new(),
+                },
+                quantity: OrderQuantity {
+                    total: item.quantity,
+                    fulfilled: fulfilled_qty,
+                },
+                totals: vec![Total {
+                    total_type: "total".to_string(),
+                    display_text: Some("Total".to_string()),
+                    amount: decimal_to_cents(item.total),
+                }],
+                status: match ic_order.fulfillment_status {
+                    stateset_embedded::FulfillmentStatus::Fulfilled => "fulfilled".to_string(),
+                    stateset_embedded::FulfillmentStatus::PartiallyFulfilled => "partial".to_string(),
+                    _ => "processing".to_string(),
+                },
+                parent_id: None,
+                extra: HashMap::new(),
+            }
+        }).collect();
+
+        let totals = vec![Total {
+            total_type: "total".to_string(),
+            display_text: Some("Total".to_string()),
+            amount: decimal_to_cents(ic_order.total_amount),
+        }];
+
+        Some(Order {
+            ucp: UcpResponseMeta {
+                version: "2026-01-11".to_string(),
+                capabilities: vec![CapabilityRef {
+                    name: "dev.ucp.shopping.order".to_string(),
+                    version: "2026-01-11".to_string(),
+                }],
+            },
+            id: order_id.to_string(),
+            checkout_id: format!("chk_{}", ic_order.id), // Best guess
+            permalink_url: format!("https://example.com/orders/{}", order_id),
+            line_items,
+            fulfillment: OrderFulfillment {
+                expectations: None,
+                events: None,
+            },
+            totals,
+            adjustments: None,
+            extra: HashMap::new(),
+        })
     }
 }
 
@@ -269,7 +492,7 @@ impl OrderService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{ItemResponse, OrderLineItem};
+    use crate::models::{ItemResponse, OrderFulfillment, OrderLineItem, OrderQuantity, Total};
 
     fn create_test_order() -> Order {
         Order {
