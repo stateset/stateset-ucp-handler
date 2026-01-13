@@ -1,5 +1,5 @@
 // Library exports for stateset-ucp-handler
-// Used by napi-node bindings and other consumers
+// Used by bindings/napi-node and other consumers
 
 pub mod a2a;
 pub mod auth;

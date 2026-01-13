@@ -1,0 +1,21 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "stateset-ucp"
+version = "0.1.0"
+description = "Python bindings for the Stateset UCP Handler"
+requires-python = ">=3.8"
+readme = "README.md"
+license = { file = "../../LICENSE" }
+keywords = ["ucp", "commerce", "checkout", "crypto", "mcp", "a2a"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Rust",
+  "Operating System :: OS Independent",
+]
+
+[tool.maturin]
+module-name = "stateset_ucp"
+features = ["pyo3/extension-module"]

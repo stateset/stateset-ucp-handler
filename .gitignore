@@ -23,9 +23,25 @@ server.log
 *.swo
 
 # Node.js (napi-node)
-napi-node/node_modules/
-napi-node/*.node
-napi-node/npm/
+bindings/napi-node/node_modules/
+bindings/napi-node/*.node
+bindings/napi-node/npm/
+
+# Bindings build artifacts
+bindings/**/target/
+bindings/go/.gocache/
+bindings/go/.gomodcache/
+bindings/python/.venv/
+bindings/ruby/.gem/
+bindings/go/*.a
+bindings/go/*.dylib
+bindings/go/*.so
+bindings/go/*.dll
+bindings/ruby/ext/**/Makefile
+bindings/ruby/ext/**/*.o
+bindings/ruby/lib/**/*.bundle
+bindings/ruby/lib/**/*.dylib
+bindings/ruby/lib/**/*.so
 
 # Claude Code plans (local development)
 .claude/

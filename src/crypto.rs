@@ -797,6 +797,48 @@ pub fn verify_json(
     verify_detached(jws, &canonical, key)
 }
 
+/// Exports a signing key (including private component) to JWK format
+pub fn export_signing_key_jwk(key: &SigningKey) -> JwkPrivateKey {
+    match &key.inner {
+        SigningKeyInner::P256(sk) => {
+            let verifying_key = P256VerifyingKey::from(sk);
+            let point = verifying_key.to_encoded_point(false);
+            let x = URL_SAFE_NO_PAD.encode(point.x().unwrap());
+            let y = URL_SAFE_NO_PAD.encode(point.y().unwrap());
+            let d = URL_SAFE_NO_PAD.encode(sk.to_bytes());
+
+            JwkPrivateKey {
+                kid: key.kid.clone(),
+                kty: "EC".to_string(),
+                crv: "P-256".to_string(),
+                x,
+                y,
+                d,
+                use_: Some("sig".to_string()),
+                alg: Some("ES256".to_string()),
+            }
+        }
+        SigningKeyInner::P384(sk) => {
+            let verifying_key = P384VerifyingKey::from(sk);
+            let point = verifying_key.to_encoded_point(false);
+            let x = URL_SAFE_NO_PAD.encode(point.x().unwrap());
+            let y = URL_SAFE_NO_PAD.encode(point.y().unwrap());
+            let d = URL_SAFE_NO_PAD.encode(sk.to_bytes());
+
+            JwkPrivateKey {
+                kid: key.kid.clone(),
+                kty: "EC".to_string(),
+                crv: "P-384".to_string(),
+                x,
+                y,
+                d,
+                use_: Some("sig".to_string()),
+                alg: Some("ES384".to_string()),
+            }
+        }
+    }
+}
+
 /// Exports a verifying key to JWK format
 pub fn export_verifying_key_jwk(key: &VerifyingKey) -> JwkKey {
     match &key.inner {

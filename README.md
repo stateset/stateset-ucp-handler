@@ -220,12 +220,12 @@ The proto definition lives at `proto/ucp_handler/v1/ucp_handler.proto`.
 
 ## Node.js Bindings
 
-Native Node.js bindings are available in the `napi-node/` directory, providing direct access to the UCP handler from Node.js/TypeScript applications.
+Native Node.js bindings are available in the `bindings/napi-node/` directory, providing direct access to the UCP handler from Node.js/TypeScript applications.
 
 ### Installation
 
 ```bash
-cd napi-node
+cd bindings/napi-node
 npm install
 npm run build
 ```
@@ -272,6 +272,18 @@ const agentCard = await a2a.agentCard();
 - **McpHandler** - Model Context Protocol (JSON-RPC 2.0) handler
 - **A2AHandler** - Google A2A protocol handler
 - **OrderService** - Post-checkout order management
+
+## Python Bindings
+
+Bindings live in `bindings/python/`. See `bindings/python/README.md` for build and usage.
+
+## Go Bindings
+
+Bindings live in `bindings/go/`. See `bindings/go/README.md` for build and usage.
+
+## Ruby Bindings
+
+Bindings live in `bindings/ruby/`. See `bindings/ruby/README.md` for build and usage.
 
 ## Notes
 

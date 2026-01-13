@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "napi-node"]
+members = [".", "bindings/napi-node"]
 resolver = "2"
 
 [package]

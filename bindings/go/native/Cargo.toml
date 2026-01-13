@@ -1,0 +1,22 @@
+[package]
+name = "stateset-ucp-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "C ABI for Stateset UCP Handler Go bindings"
+license = "BUSL-1.1"
+repository = "https://github.com/stateset/stateset-ucp-handler"
+
+[lib]
+name = "stateset_ucp_ffi"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+stateset_ucp_lib = { path = "../../..", package = "stateset-ucp-handler" }
+
+[build-dependencies]
+cbindgen = "0.26"
+
+[workspace]
