@@ -9,7 +9,7 @@ description = "Python bindings for the Stateset UCP Handler"
 requires-python = ">=3.8"
 readme = "README.md"
 license = { file = "../../LICENSE" }
-keywords = ["ucp", "commerce", "checkout", "crypto", "mcp", "a2a"]
+keywords = ["ucp", "commerce", "checkout", "crypto"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Rust",

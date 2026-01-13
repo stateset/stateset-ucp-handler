@@ -414,11 +414,11 @@ impl CheckoutService {
                     endpoint: format!("{}/mcp", self.base_url),
                 }),
                 a2a: Some(crate::models::A2AEndpoint {
-                    agent_card: format!("{}/.well-known/agent-card.json", self.base_url),
-                    endpoint: format!("{}/a2a", self.base_url),
+                    endpoint: format!("{}/.well-known/agent-card.json", self.base_url),
                 }),
                 embedded: Some(crate::models::EmbeddedEndpoint {
-                    schema: "https://ucp.dev/services/shopping/embedded.openrpc.json".to_string(),
+                    schema: "https://ucp.dev/services/shopping/embedded.openrpc.json"
+                        .to_string(),
                 }),
             },
         );
@@ -517,6 +517,7 @@ impl CheckoutService {
         self.ap2_enabled
     }
 
+    #[allow(dead_code)]
     fn response_meta(&self) -> UcpResponseMeta {
         self.response_meta_for(false, false, false, false)
     }

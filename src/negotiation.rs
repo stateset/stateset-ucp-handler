@@ -10,7 +10,6 @@ use crate::crypto::{load_verifying_key, VerifyingKey};
 use crate::models::{Capability, CapabilityRef, DiscoveryDocument, JwkKey, PaymentHandler};
 use reqwest::Client;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -19,10 +18,12 @@ use tracing::{debug, warn};
 #[derive(Debug, Error)]
 pub enum NegotiationError {
     #[error("Missing UCP-Agent header")]
+    #[allow(dead_code)]
     MissingUcpAgentHeader,
     #[error("Invalid UCP-Agent header format: {0}")]
     InvalidUcpAgentFormat(String),
     #[error("Missing profile URL in UCP-Agent header")]
+    #[allow(dead_code)]
     MissingProfileUrl,
     #[error("Failed to fetch platform profile: {0}")]
     ProfileFetchError(String),
@@ -42,7 +43,8 @@ pub enum NegotiationError {
 pub struct UcpAgent {
     /// Platform profile URL
     pub profile_url: Option<String>,
-    /// Additional parameters from the header
+    /// Additional parameters from the header (reserved for future use)
+    #[allow(dead_code)]
     pub params: HashMap<String, String>,
 }
 
@@ -67,7 +69,8 @@ pub struct PlatformProfile {
     pub version: String,
     /// Capabilities supported by platform
     pub capabilities: Vec<Capability>,
-    /// Payment handlers supported by platform
+    /// Payment handlers supported by platform (reserved for future use)
+    #[allow(dead_code)]
     pub payment_handlers: Vec<PaymentHandler>,
     /// Platform's signing keys for verification
     pub signing_keys: Vec<JwkKey>,
@@ -84,7 +87,8 @@ pub struct NegotiatedCapabilities {
     pub capabilities: Vec<CapabilityRef>,
     /// Platform's signing keys (for verifying mandates)
     pub platform_signing_keys: Vec<VerifyingKey>,
-    /// Platform's order webhook URL
+    /// Platform's order webhook URL (reserved for future use)
+    #[allow(dead_code)]
     pub platform_webhook_url: Option<String>,
 }
 
@@ -189,6 +193,7 @@ impl ProfileCache {
     }
 
     /// Clears expired entries from cache
+    #[allow(dead_code)]
     pub async fn cleanup_expired(&self) {
         let mut cache = self.cache.write().await;
         cache.retain(|_, v| !v.is_expired());

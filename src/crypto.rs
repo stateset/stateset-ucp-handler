@@ -6,12 +6,14 @@
 //! - JSON Canonicalization (RFC 8785)
 //! - JWK key loading
 
+// Public API functions for cryptographic operations - used by consumers of this crate
+#![allow(dead_code)]
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ecdsa::signature::{Signer, Verifier};
 use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey, VerifyingKey as P256VerifyingKey};
 use p384::ecdsa::{Signature as P384Signature, SigningKey as P384SigningKey, VerifyingKey as P384VerifyingKey};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256, Sha384};
 use std::cmp::Ordering;
 use thiserror::Error;
 
@@ -384,7 +386,7 @@ pub fn load_signing_key(jwk: &JwkKey) -> Result<SigningKey, CryptoError> {
         CryptoError::MissingKeyComponent("crv (curve)".to_string())
     })?;
 
-    let algorithm = SigningAlgorithm::from_curve(crv)?;
+    let _algorithm = SigningAlgorithm::from_curve(crv)?;
 
     // For signing, we need the private key component 'd'
     // If not present in JwkKey, we need to extend the model or use a different approach

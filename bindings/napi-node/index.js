@@ -310,14 +310,11 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { A2AHandler, CheckoutService, SigningAlgorithm, SigningKey, VerifyingKey, Crypto, McpHandler, mcpOpenrpcSchema, OrderService } = nativeBinding
+const { CheckoutService, SigningAlgorithm, SigningKey, VerifyingKey, Crypto, OrderService } = nativeBinding
 
-module.exports.A2AHandler = A2AHandler
 module.exports.CheckoutService = CheckoutService
 module.exports.SigningAlgorithm = SigningAlgorithm
 module.exports.SigningKey = SigningKey
 module.exports.VerifyingKey = VerifyingKey
 module.exports.Crypto = Crypto
-module.exports.McpHandler = McpHandler
-module.exports.mcpOpenrpcSchema = mcpOpenrpcSchema
 module.exports.OrderService = OrderService

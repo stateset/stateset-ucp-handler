@@ -52,7 +52,6 @@ pub struct EmbeddedEndpoint {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct A2AEndpoint {
-    pub agent_card: String,
     pub endpoint: String,
 }
 

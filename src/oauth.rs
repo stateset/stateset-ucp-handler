@@ -41,7 +41,9 @@ struct AuthCodeRecord {
 
 #[derive(Clone)]
 struct TokenRecord {
+    #[allow(dead_code)]
     client_id: String,
+    #[allow(dead_code)]
     scopes: Vec<String>,
     created_at: Instant,
 }
@@ -67,6 +69,7 @@ pub struct TokenRequest {
 #[derive(Debug, Deserialize)]
 pub struct RevocationRequest {
     pub token: String,
+    #[allow(dead_code)]
     pub token_type_hint: Option<String>,
 }
 

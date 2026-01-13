@@ -5,8 +5,11 @@
 //! - Fulfillment event tracking
 //! - Order adjustments (refunds, returns, credits)
 
+// Public API for order lifecycle management - used by consumers of this crate
+#![allow(dead_code)]
+
 use crate::errors::ServiceError;
-use crate::models::{Order, OrderFulfillment, OrderLineItem, OrderQuantity, Total, UcpResponseMeta, CapabilityRef};
+use crate::models::{Order, UcpResponseMeta, CapabilityRef};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

@@ -38,6 +38,7 @@ impl OrderWebhook {
     }
 
     /// Creates a new OrderWebhook with proper JWS signing key.
+    #[allow(dead_code)]
     pub fn with_signing_key(
         webhook_url: Option<String>,
         api_key: Option<String>,
@@ -53,6 +54,7 @@ impl OrderWebhook {
     }
 
     /// Sets the signing key for JWS signature generation.
+    #[allow(dead_code)]
     pub fn set_signing_key(&mut self, signing_key: SigningKey) {
         self.signing_key = Some(Arc::new(signing_key));
         self.legacy_signature = None;
@@ -61,6 +63,7 @@ impl OrderWebhook {
     /// Generates a JWS signature for the given payload.
     ///
     /// Returns the compact detached JWS format: header..signature
+    #[allow(dead_code)]
     fn sign_payload(&self, payload: &[u8]) -> Result<String, ServiceError> {
         let Some(key) = &self.signing_key else {
             return Err(ServiceError::InvalidState(

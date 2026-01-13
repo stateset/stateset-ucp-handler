@@ -1,454 +1,301 @@
-//! Embedded Protocol (EP) implementation.
+//! Embedded Protocol (EP) helpers.
 //!
-//! Implements the UCP Embedded Protocol for browser-based checkout flows,
-//! supporting delegation contracts and callback handling.
+//! Provides query parsing and HTML template rendering for embedded checkout
+//! handoff using the UCP Embedded Protocol (JSON-RPC 2.0 over postMessage).
 
-use crate::errors::ServiceError;
-use crate::service::CheckoutService;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::collections::HashMap;
-use tracing::{debug, info, warn};
+use serde::Deserialize;
+use std::collections::HashSet;
 
 /// Embedded Protocol query parameters
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct EmbeddedParams {
-    /// Action to perform
-    #[serde(rename = "ec_action")]
-    pub action: Option<String>,
-    /// Session ID for continuity
-    #[serde(rename = "ec_session_id")]
-    pub session_id: Option<String>,
-    /// Encoded payload (base64url JSON)
-    #[serde(rename = "ec_payload")]
-    pub payload: Option<String>,
-    /// Callback URL for results
-    #[serde(rename = "ec_callback")]
-    pub callback: Option<String>,
-    /// Platform profile URL
-    #[serde(rename = "ec_profile")]
-    pub profile: Option<String>,
+    /// UCP version for this embedded session
+    #[serde(rename = "ec_version")]
+    pub version: Option<String>,
+    /// Business-defined authentication token
+    #[serde(rename = "ec_auth")]
+    pub auth: Option<String>,
+    /// Comma-delimited list of delegations requested by the host
+    #[serde(rename = "ec_delegate")]
+    pub delegate: Option<String>,
 }
 
-/// Embedded Protocol response
-#[derive(Debug, Clone, Serialize)]
-pub struct EmbeddedResponse {
-    /// Whether the operation succeeded
-    pub success: bool,
-    /// Redirect URL (if any)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub redirect_url: Option<String>,
-    /// Result data
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<Value>,
-    /// Error message
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+impl EmbeddedParams {
+    pub fn requested_delegations(&self) -> Vec<String> {
+        let Some(raw) = self.delegate.as_deref() else {
+            return Vec::new();
+        };
+
+        let mut seen = HashSet::new();
+        let mut delegations = Vec::new();
+
+        for entry in raw.split(',').map(|value| value.trim()) {
+            if entry.is_empty() || !valid_delegation(entry) {
+                continue;
+            }
+            if seen.insert(entry.to_string()) {
+                delegations.push(entry.to_string());
+            }
+        }
+
+        delegations
+    }
 }
 
-/// Delegation contract for external service integration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DelegationContract {
-    /// Contract ID
-    pub id: String,
-    /// Delegation type (payment, fulfillment, identity)
-    #[serde(rename = "type")]
-    pub delegation_type: String,
-    /// Delegate service URL
-    pub delegate_url: String,
-    /// Required fields to be provided by delegate
-    pub required_fields: Vec<String>,
-    /// Optional fields
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub optional_fields: Option<Vec<String>>,
-    /// Callback URL for delegate response
-    pub callback_url: String,
-    /// Expiration time (RFC 3339)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<String>,
-    /// Additional contract metadata
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<HashMap<String, Value>>,
+const SUPPORTED_DELEGATIONS: [&str; 3] = [
+    "payment.instruments_change",
+    "payment.credential",
+    "fulfillment.address_change",
+];
+
+pub fn accepted_delegations(requested: &[String]) -> Vec<String> {
+    requested
+        .iter()
+        .filter(|entry| {
+            SUPPORTED_DELEGATIONS
+                .iter()
+                .any(|supported| supported == &entry.as_str())
+        })
+        .cloned()
+        .collect()
 }
 
-/// Delegation result returned from delegate
-#[derive(Debug, Clone, Deserialize)]
-pub struct DelegationResult {
-    /// Contract ID this result fulfills
-    pub contract_id: String,
-    /// Status (completed, failed, canceled)
-    pub status: String,
-    /// Result data
-    #[serde(default)]
-    pub data: HashMap<String, Value>,
-    /// Error message if failed
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+pub fn render_embedded_page(
+    checkout_json: &str,
+    ec_version: Option<&str>,
+    accepted_delegations: &[String],
+) -> String {
+    let safe_checkout = escape_json_for_script(checkout_json);
+    let version_json = serde_json::to_string(&ec_version).unwrap_or_else(|_| "null".to_string());
+    let delegates_json = serde_json::to_string(accepted_delegations)
+        .unwrap_or_else(|_| "[]".to_string());
+
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Embedded Checkout</title>
+  <style>
+    :root {{
+      color-scheme: light;
+    }}
+    body {{
+      font-family: "SF Pro Text", "Segoe UI", Arial, sans-serif;
+      margin: 0;
+      padding: 24px;
+      background: #f7f7f3;
+      color: #1f2933;
+    }}
+    main {{
+      max-width: 960px;
+      margin: 0 auto;
+      background: #ffffff;
+      border: 1px solid #e5e7eb;
+      border-radius: 12px;
+      padding: 24px;
+      box-shadow: 0 12px 32px rgba(15, 23, 42, 0.08);
+    }}
+    h1 {{
+      margin: 0 0 8px 0;
+      font-size: 20px;
+      letter-spacing: 0.2px;
+    }}
+    p {{
+      margin: 0 0 16px 0;
+      color: #475569;
+      font-size: 14px;
+    }}
+    pre {{
+      margin: 0;
+      padding: 16px;
+      background: #0f172a;
+      color: #e2e8f0;
+      border-radius: 10px;
+      overflow: auto;
+      font-size: 12px;
+    }}
+    .pill {{
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      background: #f1f5f9;
+      color: #0f172a;
+      margin-left: 8px;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Embedded Checkout <span class="pill" id="ec-status">Idle</span></h1>
+    <p id="ec-note">Loaded checkout session for embedded handoff.</p>
+    <pre id="ec-checkout"></pre>
+  </main>
+  <script>
+    (function() {{
+      const checkout = {safe_checkout};
+      const ecVersion = {version_json};
+      const acceptedDelegations = {delegates_json};
+
+      const statusEl = document.getElementById('ec-status');
+      const noteEl = document.getElementById('ec-note');
+      const checkoutEl = document.getElementById('ec-checkout');
+      checkoutEl.textContent = JSON.stringify(checkout, null, 2);
+
+      function setStatus(text) {{
+        statusEl.textContent = text;
+      }}
+
+      function parseMessage(payload) {{
+        if (!payload) return null;
+        if (typeof payload === 'string') {{
+          try {{
+            return JSON.parse(payload);
+          }} catch (err) {{
+            return null;
+          }}
+        }}
+        return payload;
+      }}
+
+      const pending = new Map();
+      let messagePort = null;
+
+      function handleMessage(payload) {{
+        const msg = parseMessage(payload);
+        if (!msg || !msg.id) {{
+          return;
+        }}
+        const key = String(msg.id);
+        const entry = pending.get(key);
+        if (!entry) {{
+          return;
+        }}
+        pending.delete(key);
+        entry.resolve(msg);
+      }}
+
+      function sendMessage(message) {{
+        if (messagePort) {{
+          messagePort.postMessage(message);
+          return;
+        }}
+        if (window.EmbeddedCheckoutProtocolConsumer && typeof window.EmbeddedCheckoutProtocolConsumer.postMessage === 'function') {{
+          window.EmbeddedCheckoutProtocolConsumer.postMessage(JSON.stringify(message));
+          return;
+        }}
+        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.EmbeddedCheckoutProtocolConsumer) {{
+          window.webkit.messageHandlers.EmbeddedCheckoutProtocolConsumer.postMessage(JSON.stringify(message));
+          return;
+        }}
+        if (window.parent) {{
+          window.parent.postMessage(message, '*');
+        }}
+      }}
+
+      window.addEventListener('message', function(event) {{
+        handleMessage(event.data);
+      }});
+
+      window.EmbeddedCheckoutProtocol = {{
+        postMessage: function(message) {{
+          handleMessage(message);
+        }}
+      }};
+
+      function sendReady() {{
+        const id = 'ready_' + Math.random().toString(36).slice(2);
+        const request = {{
+          jsonrpc: '2.0',
+          id: id,
+          method: 'ec.ready',
+          params: {{
+            delegate: acceptedDelegations
+          }}
+        }};
+        const promise = new Promise(function(resolve) {{
+          pending.set(String(id), {{ resolve: resolve }});
+        }});
+        sendMessage(request);
+        return promise;
+      }}
+
+      async function handshake() {{
+        let response = await sendReady();
+        while (response && response.result && response.result.upgrade && response.result.upgrade.port) {{
+          messagePort = response.result.upgrade.port;
+          messagePort.onmessage = function(event) {{
+            handleMessage(event.data);
+          }};
+          response = await sendReady();
+        }}
+        return response;
+      }}
+
+      function sendNotification(method, params) {{
+        sendMessage({{ jsonrpc: '2.0', method: method, params: params }});
+      }}
+
+      const canHandshake = ecVersion && (
+        (window.parent && window.parent !== window) ||
+        (window.EmbeddedCheckoutProtocolConsumer && typeof window.EmbeddedCheckoutProtocolConsumer.postMessage === 'function') ||
+        (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.EmbeddedCheckoutProtocolConsumer)
+      );
+
+      if (!ecVersion) {{
+        noteEl.textContent = 'ECP parameters missing; running in non-embedded mode.';
+        setStatus('Standalone');
+        return;
+      }}
+
+      if (!canHandshake) {{
+        noteEl.textContent = 'Embedded host channel not detected.';
+        setStatus('No Host');
+        return;
+      }}
+
+      setStatus('Handshake');
+      handshake().then(function() {{
+        setStatus('Ready');
+        sendNotification('ec.start', {{ checkout: checkout }});
+      }}).catch(function() {{
+        setStatus('Failed');
+      }});
+    }})();
+  </script>
+</body>
+</html>
+"#,
+        safe_checkout = safe_checkout,
+        version_json = version_json,
+        delegates_json = delegates_json,
+    )
 }
 
-/// Embedded checkout state
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmbeddedCheckoutState {
-    /// Checkout ID
-    pub checkout_id: String,
-    /// Current step in the flow
-    pub step: String,
-    /// Pending delegations
-    #[serde(default)]
-    pub pending_delegations: Vec<String>,
-    /// Completed delegations
-    #[serde(default)]
-    pub completed_delegations: Vec<String>,
-    /// UI customization options
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ui_options: Option<UiOptions>,
-}
-
-/// UI customization options for embedded checkout
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UiOptions {
-    /// Primary color (hex)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub primary_color: Option<String>,
-    /// Logo URL
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub logo_url: Option<String>,
-    /// Merchant name to display
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub merchant_name: Option<String>,
-    /// Custom CSS URL
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub custom_css_url: Option<String>,
-}
-
-/// Embedded Protocol handler
-#[derive(Clone)]
-pub struct EmbeddedHandler {
-    service: CheckoutService,
-    base_url: String,
-}
-
-impl EmbeddedHandler {
-    pub fn new(service: CheckoutService, base_url: String) -> Self {
-        Self { service, base_url }
+fn valid_delegation(value: &str) -> bool {
+    if value.is_empty() {
+        return false;
     }
 
-    /// Parse embedded protocol parameters from query string
-    pub fn parse_params(query: &str) -> Result<EmbeddedParams, ServiceError> {
-        serde_urlencoded::from_str(query)
-            .map_err(|e| ServiceError::InvalidInput(format!("Invalid query parameters: {}", e)))
-    }
-
-    /// Handle an embedded protocol request
-    pub async fn handle(&self, params: EmbeddedParams) -> EmbeddedResponse {
-        let action = params.action.as_deref().unwrap_or("view");
-
-        match action {
-            "view" | "start" => self.handle_view(params).await,
-            "update" => self.handle_update(params).await,
-            "delegate" => self.handle_delegate(params).await,
-            "callback" => self.handle_callback(params).await,
-            _ => EmbeddedResponse {
-                success: false,
-                redirect_url: None,
-                data: None,
-                error: Some(format!("Unknown action: {}", action)),
-            },
+    for part in value.split('.') {
+        if part.is_empty() {
+            return false;
+        }
+        if !part
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch == '_')
+        {
+            return false;
         }
     }
 
-    /// Handle view/start action - display checkout
-    async fn handle_view(&self, params: EmbeddedParams) -> EmbeddedResponse {
-        let Some(session_id) = params.session_id else {
-            return EmbeddedResponse {
-                success: false,
-                redirect_url: None,
-                data: None,
-                error: Some("Missing ec_session_id".to_string()),
-            };
-        };
-
-        match self.service.get_checkout(&session_id).await {
-            Ok(checkout) => {
-                let state = EmbeddedCheckoutState {
-                    checkout_id: checkout.id.clone(),
-                    step: match checkout.status {
-                        crate::models::CheckoutStatus::Incomplete => "buyer_info".to_string(),
-                        crate::models::CheckoutStatus::RequiresEscalation => "review".to_string(),
-                        crate::models::CheckoutStatus::ReadyForComplete => "payment".to_string(),
-                        crate::models::CheckoutStatus::CompleteInProgress => "processing".to_string(),
-                        crate::models::CheckoutStatus::Completed => "confirmation".to_string(),
-                        crate::models::CheckoutStatus::Canceled => "canceled".to_string(),
-                    },
-                    pending_delegations: vec![],
-                    completed_delegations: vec![],
-                    ui_options: None,
-                };
-
-                EmbeddedResponse {
-                    success: true,
-                    redirect_url: Some(format!(
-                        "{}/checkout/{}/embedded",
-                        self.base_url, checkout.id
-                    )),
-                    data: Some(serde_json::json!({
-                        "checkout": checkout,
-                        "state": state
-                    })),
-                    error: None,
-                }
-            }
-            Err(e) => EmbeddedResponse {
-                success: false,
-                redirect_url: None,
-                data: None,
-                error: Some(e.to_string()),
-            },
-        }
-    }
-
-    /// Handle update action - update checkout from embedded UI
-    async fn handle_update(&self, params: EmbeddedParams) -> EmbeddedResponse {
-        let Some(session_id) = params.session_id else {
-            return EmbeddedResponse {
-                success: false,
-                redirect_url: None,
-                data: None,
-                error: Some("Missing ec_session_id".to_string()),
-            };
-        };
-
-        let Some(payload) = params.payload else {
-            return EmbeddedResponse {
-                success: false,
-                redirect_url: None,
-                data: None,
-                error: Some("Missing ec_payload".to_string()),
-            };
-        };
-
-        // Decode base64url payload
-        let decoded = match decode_payload(&payload) {
-            Ok(d) => d,
-            Err(e) => {
-                return EmbeddedResponse {
-                    success: false,
-                    redirect_url: None,
-                    data: None,
-                    error: Some(format!("Invalid payload: {}", e)),
-                };
-            }
-        };
-
-        // Parse as update request
-        let update_request: crate::models::CheckoutUpdateRequest = match serde_json::from_value(decoded) {
-            Ok(req) => req,
-            Err(e) => {
-                return EmbeddedResponse {
-                    success: false,
-                    redirect_url: None,
-                    data: None,
-                    error: Some(format!("Invalid update request: {}", e)),
-                };
-            }
-        };
-
-        match self.service.update_checkout(&session_id, update_request).await {
-            Ok(checkout) => EmbeddedResponse {
-                success: true,
-                redirect_url: None,
-                data: Some(serde_json::to_value(&checkout).unwrap_or_default()),
-                error: None,
-            },
-            Err(e) => EmbeddedResponse {
-                success: false,
-                redirect_url: None,
-                data: None,
-                error: Some(e.to_string()),
-            },
-        }
-    }
-
-    /// Handle delegate action - create a delegation contract
-    async fn handle_delegate(&self, params: EmbeddedParams) -> EmbeddedResponse {
-        let Some(session_id) = params.session_id else {
-            return EmbeddedResponse {
-                success: false,
-                redirect_url: None,
-                data: None,
-                error: Some("Missing ec_session_id".to_string()),
-            };
-        };
-
-        let Some(payload) = params.payload else {
-            return EmbeddedResponse {
-                success: false,
-                redirect_url: None,
-                data: None,
-                error: Some("Missing ec_payload (delegation type)".to_string()),
-            };
-        };
-
-        // Decode payload to get delegation type
-        let decoded = match decode_payload(&payload) {
-            Ok(d) => d,
-            Err(e) => {
-                return EmbeddedResponse {
-                    success: false,
-                    redirect_url: None,
-                    data: None,
-                    error: Some(format!("Invalid payload: {}", e)),
-                };
-            }
-        };
-
-        let delegation_type = decoded
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("payment");
-
-        let contract = self.create_delegation_contract(&session_id, delegation_type);
-
-        EmbeddedResponse {
-            success: true,
-            redirect_url: Some(contract.delegate_url.clone()),
-            data: Some(serde_json::to_value(&contract).unwrap_or_default()),
-            error: None,
-        }
-    }
-
-    /// Handle callback action - process delegation result
-    async fn handle_callback(&self, params: EmbeddedParams) -> EmbeddedResponse {
-        let Some(payload) = params.payload else {
-            return EmbeddedResponse {
-                success: false,
-                redirect_url: None,
-                data: None,
-                error: Some("Missing ec_payload (delegation result)".to_string()),
-            };
-        };
-
-        let decoded = match decode_payload(&payload) {
-            Ok(d) => d,
-            Err(e) => {
-                return EmbeddedResponse {
-                    success: false,
-                    redirect_url: None,
-                    data: None,
-                    error: Some(format!("Invalid payload: {}", e)),
-                };
-            }
-        };
-
-        let result: DelegationResult = match serde_json::from_value(decoded) {
-            Ok(r) => r,
-            Err(e) => {
-                return EmbeddedResponse {
-                    success: false,
-                    redirect_url: None,
-                    data: None,
-                    error: Some(format!("Invalid delegation result: {}", e)),
-                };
-            }
-        };
-
-        if result.status == "completed" {
-            EmbeddedResponse {
-                success: true,
-                redirect_url: params.callback,
-                data: Some(serde_json::json!({
-                    "contract_id": result.contract_id,
-                    "status": "completed"
-                })),
-                error: None,
-            }
-        } else {
-            EmbeddedResponse {
-                success: false,
-                redirect_url: params.callback,
-                data: None,
-                error: result.error,
-            }
-        }
-    }
-
-    /// Create a delegation contract for external service
-    pub fn create_delegation_contract(&self, checkout_id: &str, delegation_type: &str) -> DelegationContract {
-        let contract_id = format!("dlg_{}", uuid::Uuid::new_v4());
-
-        let (required_fields, delegate_url) = match delegation_type {
-            "payment" => (
-                vec![
-                    "payment_method".to_string(),
-                    "card_last_four".to_string(),
-                    "card_brand".to_string(),
-                ],
-                format!("{}/delegate/payment", self.base_url),
-            ),
-            "fulfillment" => (
-                vec![
-                    "address_line1".to_string(),
-                    "city".to_string(),
-                    "postal_code".to_string(),
-                    "country".to_string(),
-                ],
-                format!("{}/delegate/fulfillment", self.base_url),
-            ),
-            "identity" => (
-                vec!["email".to_string(), "name".to_string()],
-                format!("{}/delegate/identity", self.base_url),
-            ),
-            _ => (vec![], format!("{}/delegate/generic", self.base_url)),
-        };
-
-        let expires_at = chrono::Utc::now() + chrono::Duration::minutes(30);
-
-        DelegationContract {
-            id: contract_id,
-            delegation_type: delegation_type.to_string(),
-            delegate_url,
-            required_fields,
-            optional_fields: None,
-            callback_url: format!(
-                "{}/checkout/{}/embedded?ec_action=callback",
-                self.base_url, checkout_id
-            ),
-            expires_at: Some(expires_at.to_rfc3339()),
-            metadata: Some({
-                let mut meta = HashMap::new();
-                meta.insert("checkout_id".to_string(), serde_json::json!(checkout_id));
-                meta
-            }),
-        }
-    }
-
-    /// Get delegation contract by type
-    pub fn delegation_contract(&self, checkout_id: &str, delegation_type: &str) -> DelegationContract {
-        self.create_delegation_contract(checkout_id, delegation_type)
-    }
+    true
 }
 
-/// Decode base64url encoded JSON payload
-fn decode_payload(encoded: &str) -> Result<Value, ServiceError> {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-
-    let decoded_bytes = URL_SAFE_NO_PAD
-        .decode(encoded)
-        .map_err(|e| ServiceError::InvalidInput(format!("Base64 decode error: {}", e)))?;
-
-    let json_str = String::from_utf8(decoded_bytes)
-        .map_err(|e| ServiceError::InvalidInput(format!("UTF-8 decode error: {}", e)))?;
-
-    serde_json::from_str(&json_str)
-        .map_err(|e| ServiceError::InvalidInput(format!("JSON parse error: {}", e)))
-}
-
-/// Encode JSON payload as base64url
-pub fn encode_payload(value: &Value) -> String {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-
-    let json_str = serde_json::to_string(value).unwrap_or_default();
-    URL_SAFE_NO_PAD.encode(json_str.as_bytes())
+fn escape_json_for_script(value: &str) -> String {
+    value.replace("</", "<\\/")
 }
 
 #[cfg(test)]
@@ -456,43 +303,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_params() {
-        let query = "ec_action=view&ec_session_id=chk_123&ec_callback=https://example.com/callback";
-        let params = EmbeddedHandler::parse_params(query).unwrap();
-
-        assert_eq!(params.action, Some("view".to_string()));
-        assert_eq!(params.session_id, Some("chk_123".to_string()));
-        assert_eq!(params.callback, Some("https://example.com/callback".to_string()));
-    }
-
-    #[test]
-    fn test_encode_decode_payload() {
-        let original = serde_json::json!({
-            "type": "payment",
-            "amount": 1000
-        });
-
-        let encoded = encode_payload(&original);
-        let decoded = decode_payload(&encoded).unwrap();
-
-        assert_eq!(original, decoded);
-    }
-
-    #[test]
-    fn test_delegation_contract_serialization() {
-        let contract = DelegationContract {
-            id: "dlg_123".to_string(),
-            delegation_type: "payment".to_string(),
-            delegate_url: "https://pay.example.com".to_string(),
-            required_fields: vec!["card_number".to_string()],
-            optional_fields: None,
-            callback_url: "https://example.com/callback".to_string(),
-            expires_at: None,
-            metadata: None,
+    fn parses_requested_delegations() {
+        let params = EmbeddedParams {
+            delegate: Some("payment.credential, fulfillment.address_change,invalid-foo".to_string()),
+            ..EmbeddedParams::default()
         };
 
-        let json = serde_json::to_string(&contract).unwrap();
-        assert!(json.contains("\"type\":\"payment\""));
-        assert!(json.contains("\"delegate_url\""));
+        let delegations = params.requested_delegations();
+        assert_eq!(
+            delegations,
+            vec!["payment.credential".to_string(), "fulfillment.address_change".to_string()]
+        );
+    }
+
+    #[test]
+    fn accepts_supported_delegations() {
+        let requested = vec![
+            "payment.credential".to_string(),
+            "identity.link".to_string(),
+        ];
+        let accepted = accepted_delegations(&requested);
+        assert_eq!(accepted, vec!["payment.credential".to_string()]);
     }
 }

@@ -3,7 +3,7 @@ use axum::{
     extract::{Extension, Form, Path, Query, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
-    response::{IntoResponse, Redirect, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -44,11 +44,11 @@ use crypto::{
     canonicalize, load_signing_key_from_private, sign_detached, verify_detached, DetachedJws,
     JwkPrivateKey, SigningKey,
 };
-use embedded::{EmbeddedHandler, EmbeddedParams};
+use embedded::{accepted_delegations, render_embedded_page, EmbeddedParams};
 use errors::ApiError;
 use events::{Event, EventSender};
 use idempotency::{idempotency_middleware, CachedBody, IdempotencyStore};
-use mcp::{JsonRpcRequest, McpHandler};
+use mcp::{extract_profile_url, error_codes as mcp_error_codes, JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpHandler};
 use models::{
     Capability, CheckoutCompleteRequest, CheckoutCreateRequest, CheckoutUpdateRequest,
     DetokenizeRequest, OrderEvent, TokenizeRequest,
@@ -82,7 +82,6 @@ pub struct AppState {
     profile_cache: Arc<ProfileCache>,
     mcp_handler: Arc<McpHandler>,
     a2a_handler: Arc<A2AHandler>,
-    embedded_handler: Arc<EmbeddedHandler>,
     response_signing_key: Option<Arc<SigningKey>>,
     business_capabilities: Arc<Vec<Capability>>,
     business_version: String,
@@ -235,12 +234,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.ucp_version.clone(),
     ));
 
-    // Embedded protocol handler
-    let embedded_handler = Arc::new(EmbeddedHandler::new(
-        service.clone(),
-        config.base_url.clone(),
-    ));
-
     let state = AppState {
         service,
         auth,
@@ -254,7 +247,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         profile_cache,
         mcp_handler,
         a2a_handler,
-        embedded_handler,
         response_signing_key,
         business_capabilities,
         business_version,
@@ -341,19 +333,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/mcp",
             post(mcp_handler_endpoint)
-                .layer(middleware::from_fn_with_state(
-                    state.clone(),
-                    idempotency_middleware,
-                ))
-                .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
-                .layer(middleware::from_fn_with_state(
-                    state.clone(),
-                    require_headers_middleware,
-                ))
-                .layer(middleware::from_fn_with_state(
-                    state.clone(),
-                    ucp_agent_middleware,
-                )),
+                .layer(middleware::from_fn_with_state(state.clone(), auth_middleware)),
         )
         .route("/schemas/shopping/mcp.openrpc.json", get(mcp_schema));
     app = app.merge(mcp_router);
@@ -364,14 +344,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/a2a",
             post(a2a_handler_endpoint)
-                .layer(middleware::from_fn_with_state(
-                    state.clone(),
-                    idempotency_middleware,
-                ))
                 .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
                 .layer(middleware::from_fn_with_state(
                     state.clone(),
-                    require_headers_middleware,
+                    a2a_extensions_middleware,
                 ))
                 .layer(middleware::from_fn_with_state(
                     state.clone(),
@@ -381,15 +357,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     app = app.merge(a2a_router);
 
     // Embedded Protocol
-    let embedded_router = Router::new().route(
-        "/checkout/:id/embedded",
-        get(embedded_checkout)
-            .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                require_headers_middleware,
-            )),
-    );
+    let embedded_router = Router::new()
+        .route("/checkout/:id", get(embedded_checkout))
+        .route("/checkout/:id/embedded", get(embedded_checkout));
     app = app.merge(embedded_router);
 
     let grpc_state = state.clone();
@@ -869,6 +839,37 @@ async fn require_headers_middleware(
     next.run(request).await
 }
 
+async fn a2a_extensions_middleware(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: Request,
+    next: Next,
+) -> Response {
+    if request.method() == Method::OPTIONS {
+        return next.run(request).await;
+    }
+
+    let expected = format!(
+        "https://ucp.dev/specification/reference?v={}",
+        state.business_version
+    );
+
+    let header_value = headers.get("X-A2A-Extensions").and_then(|value| value.to_str().ok());
+    let has_extension = header_value
+        .map(|value| value.split(',').any(|entry| entry.trim() == expected))
+        .unwrap_or(false);
+
+    if !has_extension {
+        return json_error_response(
+            StatusCode::BAD_REQUEST,
+            "missing_a2a_extensions",
+            "X-A2A-Extensions header must include the UCP extension URI",
+        );
+    }
+
+    next.run(request).await
+}
+
 fn verify_request_signature(
     signature: &str,
     payload: &[u8],
@@ -1045,14 +1046,83 @@ fn build_json_response<T: Serialize>(
 /// MCP JSON-RPC 2.0 endpoint handler
 async fn mcp_handler_endpoint(
     State(state): State<AppState>,
-    Extension(context): Extension<UcpRequestContext>,
     Json(request): Json<JsonRpcRequest>,
 ) -> impl IntoResponse {
+    let Some(profile_url) = extract_profile_url(&request.params) else {
+        let response = mcp_error_response(
+            request.id,
+            mcp_error_codes::INVALID_PARAMS,
+            "Missing _meta.ucp.profile",
+            "missing_ucp_profile",
+        );
+        return (StatusCode::OK, Json(response));
+    };
+
+    let header_value = format!("profile=\"{}\"", profile_url);
+    let negotiated = match negotiate(
+        Some(header_value.as_str()),
+        state.business_capabilities.as_ref(),
+        &state.business_version,
+        state.profile_cache.as_ref(),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(err) => {
+            let response = mcp_error_response(
+                request.id,
+                mcp_error_codes::INVALID_PARAMS,
+                &format!("Negotiation failed: {}", err),
+                negotiation_error_code(&err),
+            );
+            return (StatusCode::OK, Json(response));
+        }
+    };
+
     let response = state
         .mcp_handler
-        .handle_with_context(request, Some(&context.negotiated))
+        .handle_with_context(request, Some(&negotiated))
         .await;
     (StatusCode::OK, Json(response))
+}
+
+fn mcp_error_response(
+    id: serde_json::Value,
+    code: i32,
+    message: &str,
+    ucp_code: &str,
+) -> JsonRpcResponse {
+    JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        result: None,
+        error: Some(JsonRpcError {
+            code,
+            message: message.to_string(),
+            data: Some(serde_json::json!({
+                "status": "error",
+                "errors": [
+                    {
+                        "code": ucp_code,
+                        "message": message,
+                        "severity": "recoverable"
+                    }
+                ]
+            })),
+        }),
+        id,
+    }
+}
+
+fn negotiation_error_code(err: &NegotiationError) -> &'static str {
+    match err {
+        NegotiationError::MissingUcpAgentHeader => "missing_ucp_agent",
+        NegotiationError::InvalidUcpAgentFormat(_) => "invalid_ucp_agent",
+        NegotiationError::MissingProfileUrl => "missing_ucp_profile",
+        NegotiationError::ProfileFetchError(_) => "profile_fetch_error",
+        NegotiationError::InvalidProfile(_) => "invalid_profile",
+        NegotiationError::VersionNotSupported { .. } => "version_unsupported",
+        NegotiationError::HttpError(_) => "http_error",
+    }
 }
 
 /// MCP OpenRPC schema endpoint
@@ -1085,12 +1155,130 @@ async fn embedded_checkout(
     State(state): State<AppState>,
     Path(checkout_id): Path<String>,
     Query(params): Query<EmbeddedParams>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    // Override session_id with path parameter
-    let params = EmbeddedParams {
-        session_id: Some(checkout_id),
-        ..params
+    if state.auth.requires_auth() {
+        let token = extract_auth_token(&headers).or_else(|| params.auth.clone());
+        let Some(token) = token else {
+            let page = embedded_error_page(
+                "Unauthorized",
+                "Missing authentication credentials for embedded checkout.",
+            );
+            return (StatusCode::UNAUTHORIZED, Html(page));
+        };
+
+        if !state.auth.validate_token(&token).await {
+            let page = embedded_error_page(
+                "Unauthorized",
+                "Invalid authentication token for embedded checkout.",
+            );
+            return (StatusCode::UNAUTHORIZED, Html(page));
+        }
+    }
+
+    if let Some(version) = params.version.as_deref() {
+        if version != state.business_version {
+            let page = embedded_error_page(
+                "Unsupported Version",
+                &format!(
+                    "Embedded checkout version {} is not supported. Expected {}.",
+                    version, state.business_version
+                ),
+            );
+            return (StatusCode::BAD_REQUEST, Html(page));
+        }
+    }
+
+    let checkout = match state.service.get_checkout(&checkout_id).await {
+        Ok(checkout) => checkout,
+        Err(err) => {
+            let page = embedded_error_page("Checkout Not Found", &err.to_string());
+            return (StatusCode::NOT_FOUND, Html(page));
+        }
     };
-    let response = state.embedded_handler.handle(params).await;
-    (StatusCode::OK, Json(response))
+
+    let requested_delegations = params.requested_delegations();
+    let accepted = accepted_delegations(&requested_delegations);
+    let checkout_json = serde_json::to_string(&checkout).unwrap_or_else(|_| "{}".to_string());
+    let page = render_embedded_page(&checkout_json, params.version.as_deref(), &accepted);
+    (StatusCode::OK, Html(page))
+}
+
+fn extract_auth_token(headers: &HeaderMap) -> Option<String> {
+    if let Some(value) = headers.get("Authorization") {
+        if let Ok(header) = value.to_str() {
+            if let Some(token) = header.strip_prefix("Bearer ") {
+                return Some(token.to_string());
+            }
+        }
+    }
+
+    if let Some(value) = headers.get("X-API-Key") {
+        if let Ok(header) = value.to_str() {
+            return Some(header.to_string());
+        }
+    }
+
+    None
+}
+
+fn embedded_error_page(title: &str, message: &str) -> String {
+    let title = escape_html(title);
+    let message = escape_html(message);
+
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <style>
+    body {{
+      font-family: "SF Pro Text", "Segoe UI", Arial, sans-serif;
+      margin: 0;
+      padding: 24px;
+      background: #fff4f0;
+      color: #1f2933;
+    }}
+    main {{
+      max-width: 680px;
+      margin: 0 auto;
+      background: #ffffff;
+      border: 1px solid #fed7c7;
+      border-radius: 12px;
+      padding: 24px;
+      box-shadow: 0 10px 28px rgba(31, 41, 51, 0.08);
+    }}
+    h1 {{
+      margin: 0 0 8px 0;
+      font-size: 20px;
+    }}
+    p {{
+      margin: 0;
+      color: #7f1d1d;
+      font-size: 14px;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{title}</h1>
+    <p>{message}</p>
+  </main>
+</body>
+</html>
+"#,
+        title = title,
+        message = message,
+    )
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\"', "&quot;")
+        .replace('\'', "&#39;")
 }
