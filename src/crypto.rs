@@ -15,6 +15,7 @@ use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey, Veri
 use p384::ecdsa::{Signature as P384Signature, SigningKey as P384SigningKey, VerifyingKey as P384VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::str::FromStr;
 use thiserror::Error;
 
 use crate::models::JwkKey;
@@ -53,19 +54,23 @@ impl SigningAlgorithm {
         }
     }
 
-    pub fn from_str(s: &str) -> Result<Self, CryptoError> {
-        match s {
-            "ES256" => Ok(SigningAlgorithm::ES256),
-            "ES384" => Ok(SigningAlgorithm::ES384),
-            _ => Err(CryptoError::UnsupportedAlgorithm(s.to_string())),
-        }
-    }
-
     pub fn from_curve(crv: &str) -> Result<Self, CryptoError> {
         match crv {
             "P-256" => Ok(SigningAlgorithm::ES256),
             "P-384" => Ok(SigningAlgorithm::ES384),
             _ => Err(CryptoError::UnsupportedAlgorithm(format!("curve {}", crv))),
+        }
+    }
+}
+
+impl FromStr for SigningAlgorithm {
+    type Err = CryptoError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "ES256" => Ok(SigningAlgorithm::ES256),
+            "ES384" => Ok(SigningAlgorithm::ES384),
+            _ => Err(CryptoError::UnsupportedAlgorithm(s.to_string())),
         }
     }
 }
@@ -205,7 +210,7 @@ fn canonicalize_number(n: &serde_json::Number) -> String {
             return "null".to_string(); // Not valid in JSON, but handle gracefully
         }
         let abs = f.abs();
-        let use_exponent = abs >= 1e21 || abs < 1e-6;
+        let use_exponent = !(1e-6..1e21).contains(&abs);
         let raw = n.to_string();
         if use_exponent {
             if raw.contains('e') || raw.contains('E') {
@@ -261,7 +266,7 @@ fn compare_utf16(a: &str, b: &str) -> Ordering {
 }
 
 fn normalize_exponent(raw: &str) -> String {
-    let Some(pos) = raw.find(|c| c == 'e' || c == 'E') else {
+    let Some(pos) = raw.find(['e', 'E']) else {
         return raw.to_string();
     };
     let (mantissa, exp_part) = raw.split_at(pos);
@@ -339,7 +344,7 @@ fn to_exponent(raw: &str) -> String {
 }
 
 fn parse_number(raw: &str) -> Option<(bool, String, i32, i32)> {
-    let (base, exponent) = match raw.find(|c| c == 'e' || c == 'E') {
+    let (base, exponent) = match raw.find(['e', 'E']) {
         Some(pos) => {
             let (left, right) = raw.split_at(pos);
             let exponent: i32 = right[1..].parse().ok()?;
@@ -521,7 +526,7 @@ pub fn generate_key_pair(algorithm: SigningAlgorithm, kid: String) -> (SigningKe
     match algorithm {
         SigningAlgorithm::ES256 => {
             let signing_key = P256SigningKey::random(&mut rand_core::OsRng);
-            let verifying_key = signing_key.verifying_key().clone();
+            let verifying_key = *signing_key.verifying_key();
 
             (
                 SigningKey {
@@ -538,7 +543,7 @@ pub fn generate_key_pair(algorithm: SigningAlgorithm, kid: String) -> (SigningKe
         }
         SigningAlgorithm::ES384 => {
             let signing_key = P384SigningKey::random(&mut rand_core::OsRng);
-            let verifying_key = signing_key.verifying_key().clone();
+            let verifying_key = *signing_key.verifying_key();
 
             (
                 SigningKey {
@@ -669,7 +674,7 @@ pub fn verify_detached(
     }
 
     // Verify algorithm matches
-    let alg = SigningAlgorithm::from_str(&header.alg)?;
+    let alg = header.alg.parse::<SigningAlgorithm>()?;
     if alg != key.algorithm {
         return Err(CryptoError::UnsupportedAlgorithm(format!(
             "Key uses {:?} but JWS uses {}",
@@ -732,7 +737,7 @@ pub fn verify_detached_b64(
         ));
     }
 
-    let alg = SigningAlgorithm::from_str(&header.alg)?;
+    let alg = header.alg.parse::<SigningAlgorithm>()?;
     if alg != key.algorithm {
         return Err(CryptoError::UnsupportedAlgorithm(format!(
             "Key uses {:?} but JWS uses {}",

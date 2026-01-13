@@ -265,3 +265,128 @@ impl Config {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvSnapshot {
+        saved: Vec<(String, Option<String>)>,
+    }
+
+    impl EnvSnapshot {
+        fn new(keys: &[&str]) -> Self {
+            let saved = keys
+                .iter()
+                .map(|key| (key.to_string(), env::var(key).ok()))
+                .collect();
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvSnapshot {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                match value {
+                    Some(value) => env::set_var(&key, value),
+                    None => env::remove_var(&key),
+                }
+            }
+        }
+    }
+
+    fn clear_env(keys: &[&str]) {
+        for key in keys {
+            env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn load_defaults_when_env_missing() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let keys = [
+            "HOST",
+            "PORT",
+            "UCP_VERSION",
+            "UCP_SERVICE_VERSION",
+            "UCP_API_KEYS",
+            "UCP_REQUIRE_AUTH",
+            "UCP_PUBLIC_BASE_URL",
+            "UCP_REQUIRE_IDEMPOTENCY",
+            "UCP_REQUIRE_REQUEST_ID",
+            "UCP_BUYER_CONSENT_ENABLED",
+            "UCP_AP2_ENABLED",
+            "UCP_AP2_MERCHANT_AUTH",
+            "UCP_AP2_SIGNING_KEY_ID",
+            "UCP_SIGNING_PRIVATE_KEY_JSON",
+            "UCP_SESSION_TTL_SECONDS",
+            "UCP_TAX_BPS",
+            "UCP_OAUTH_ENABLED",
+            "UCP_OAUTH_REDIRECT_URIS",
+            "UCP_OAUTH_SCOPES",
+            "UCP_TOKEN_TTL_SECONDS",
+            "UCP_TOKEN_SINGLE_USE",
+            "UCP_REQUIRE_UCP_AGENT",
+            "UCP_REQUIRE_REQUEST_SIGNATURE",
+            "COMMERCE_ENABLED",
+            "COMMERCE_DB_PATH",
+            "USE_ICOMMERCE_TAX",
+            "USE_ICOMMERCE_PROMOTIONS",
+            "USE_ICOMMERCE_SHIPPING",
+        ];
+        let _snapshot = EnvSnapshot::new(&keys);
+        clear_env(&keys);
+
+        let config = Config::load().unwrap();
+        assert_eq!(config.host, "0.0.0.0");
+        assert_eq!(config.port, 8081);
+        assert_eq!(config.ucp_version, "2026-01-11");
+        assert!(config.api_keys.is_empty());
+        assert!(!config.require_auth);
+    }
+
+    #[test]
+    fn load_sets_require_auth_when_api_keys_present() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let keys = ["UCP_API_KEYS", "UCP_REQUIRE_AUTH"];
+        let _snapshot = EnvSnapshot::new(&keys);
+        clear_env(&keys);
+
+        env::set_var("UCP_API_KEYS", "key-1, key-2");
+        let config = Config::load().unwrap();
+        assert!(config.require_auth);
+        assert_eq!(config.api_keys, vec!["key-1".to_string(), "key-2".to_string()]);
+    }
+
+    #[test]
+    fn load_errors_when_oauth_enabled_without_redirects() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let keys = ["UCP_OAUTH_ENABLED", "UCP_OAUTH_REDIRECT_URIS"];
+        let _snapshot = EnvSnapshot::new(&keys);
+        clear_env(&keys);
+
+        env::set_var("UCP_OAUTH_ENABLED", "true");
+        let result = Config::load();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_errors_when_ap2_enabled_without_auth() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let keys = [
+            "UCP_AP2_ENABLED",
+            "UCP_AP2_MERCHANT_AUTH",
+            "UCP_SIGNING_PRIVATE_KEY_JSON",
+        ];
+        let _snapshot = EnvSnapshot::new(&keys);
+        clear_env(&keys);
+
+        env::set_var("UCP_AP2_ENABLED", "true");
+        let result = Config::load();
+        assert!(result.is_err());
+    }
+}

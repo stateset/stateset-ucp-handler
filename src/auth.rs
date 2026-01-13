@@ -98,3 +98,45 @@ fn unauthorized_response() -> Response {
     )
         .into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn extract_api_key_from_bearer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", HeaderValue::from_static("Bearer test-token"));
+        assert_eq!(extract_api_key(&headers), Some("test-token".to_string()));
+    }
+
+    #[test]
+    fn extract_api_key_from_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-API-Key", HeaderValue::from_static("api-key-1"));
+        assert_eq!(extract_api_key(&headers), Some("api-key-1".to_string()));
+    }
+
+    #[test]
+    fn extract_api_key_prefers_bearer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", HeaderValue::from_static("Bearer token-a"));
+        headers.insert("X-API-Key", HeaderValue::from_static("token-b"));
+        assert_eq!(extract_api_key(&headers), Some("token-a".to_string()));
+    }
+
+    #[test]
+    fn extract_api_key_rejects_non_bearer_auth() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", HeaderValue::from_static("Basic abc123"));
+        assert_eq!(extract_api_key(&headers), None);
+    }
+
+    #[tokio::test]
+    async fn validate_token_accepts_api_key() {
+        let auth = AuthConfig::new(true, vec!["key-1".to_string()], None);
+        assert!(auth.validate_token("key-1").await);
+        assert!(!auth.validate_token("key-2").await);
+    }
+}

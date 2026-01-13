@@ -3,6 +3,7 @@
 //! This module handles all type conversions between:
 //! - UCP Handler types (i64 cents, String IDs)
 //! - iCommerce types (rust_decimal::Decimal, uuid::Uuid)
+#![allow(dead_code)]
 
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;

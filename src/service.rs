@@ -1,3 +1,7 @@
+//! Checkout service orchestration for UCP sessions.
+//!
+//! Handles checkout lifecycle, totals/discounts, and optional AP2/identity features.
+
 use crate::catalog::ProductCatalog;
 use crate::crypto::{canonicalize, sign_detached_b64, SigningKey};
 use crate::errors::ServiceError;
@@ -27,9 +31,11 @@ const IDENTITY_LINKING_CAPABILITY: &str = "dev.ucp.common.identity_linking";
 const BUYER_CONSENT_CAPABILITY: &str = "dev.ucp.shopping.buyer_consent";
 
 pub trait Ap2MandateVerifier: Send + Sync {
+    /// Validate an AP2 mandate payload before completion.
     fn verify(&self, mandate: &str) -> Result<(), ServiceError>;
 }
 
+/// AP2 verifier that only validates detached JWS formatting.
 #[derive(Default)]
 pub struct FormatOnlyAp2MandateVerifier;
 
@@ -63,6 +69,7 @@ struct DiscountOutcome {
     order_discount: i64,
 }
 
+/// Core checkout lifecycle service for UCP sessions.
 #[derive(Clone)]
 pub struct CheckoutService {
     store: CheckoutStore,
@@ -86,6 +93,8 @@ pub struct CheckoutService {
 }
 
 impl CheckoutService {
+    /// Create a new checkout service with feature flags and dependencies.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: CheckoutStore,
         catalog: ProductCatalog,
@@ -148,10 +157,11 @@ impl CheckoutService {
             ap2_merchant_authorization,
             ap2_signing_key,
             ap2_mandate_verifier: ap2_mandate_verifier
-                .unwrap_or_else(|| Arc::new(FormatOnlyAp2MandateVerifier::default())),
+                .unwrap_or_else(|| Arc::new(FormatOnlyAp2MandateVerifier)),
         }
     }
 
+    /// Create a new checkout session and return the response payload.
     pub async fn create_checkout(
         &self,
         request: CheckoutCreateRequest,
@@ -218,6 +228,7 @@ impl CheckoutService {
         Ok(checkout)
     }
 
+    /// Load an existing checkout session by ID.
     pub async fn get_checkout(&self, checkout_id: &str) -> Result<CheckoutResponse, ServiceError> {
         self.store
             .get(checkout_id)
@@ -225,6 +236,7 @@ impl CheckoutService {
             .ok_or_else(|| ServiceError::NotFound(format!("Checkout {} not found", checkout_id)))
     }
 
+    /// Update a checkout session, re-evaluating totals/requirements.
     pub async fn update_checkout(
         &self,
         checkout_id: &str,
@@ -308,6 +320,7 @@ impl CheckoutService {
         Ok(checkout)
     }
 
+    /// Complete a checkout session using provided payment data.
     pub async fn complete_checkout(
         &self,
         checkout_id: &str,
@@ -317,6 +330,7 @@ impl CheckoutService {
             .await
     }
 
+    /// Complete a checkout session with validation requirements.
     pub async fn complete_checkout_with_requirements(
         &self,
         checkout_id: &str,
@@ -383,6 +397,7 @@ impl CheckoutService {
         Ok(checkout)
     }
 
+    /// Cancel an existing checkout session.
     pub async fn cancel_checkout(&self, checkout_id: &str) -> Result<CheckoutResponse, ServiceError> {
         let mut checkout = self.get_checkout(checkout_id).await?;
 
@@ -401,6 +416,7 @@ impl CheckoutService {
         Ok(checkout)
     }
 
+    /// Build the discovery document describing supported capabilities.
     pub fn discovery_document(&self) -> crate::models::DiscoveryDocument {
         let mut services = HashMap::new();
         services.insert(
@@ -508,14 +524,17 @@ impl CheckoutService {
         }
     }
 
+    /// Return the supported business capabilities.
     pub fn business_capabilities(&self) -> Vec<Capability> {
         self.discovery_document().ucp.capabilities
     }
 
+    /// Return the business version string.
     pub fn business_version(&self) -> &str {
         &self.ucp_version
     }
 
+    /// Return whether AP2 mandate support is enabled.
     pub fn ap2_enabled(&self) -> bool {
         self.ap2_enabled
     }
@@ -1824,7 +1843,7 @@ mod tests {
 
     #[test]
     fn format_only_ap2_verifier_checks_structure() {
-        let verifier = FormatOnlyAp2MandateVerifier::default();
+        let verifier = FormatOnlyAp2MandateVerifier;
 
         assert!(verifier.verify("header.payload.signature").is_ok());
         assert!(verifier.verify("missingdots").is_err());

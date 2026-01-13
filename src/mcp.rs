@@ -310,7 +310,7 @@ impl McpHandler {
 
         let checkout_payload = params_map
             .remove("checkout")
-            .unwrap_or_else(|| Value::Object(params_map));
+            .unwrap_or(Value::Object(params_map));
 
         let create_request: CheckoutCreateRequest = match serde_json::from_value(checkout_payload) {
             Ok(req) => req,
@@ -437,7 +437,7 @@ impl McpHandler {
 
         let mut checkout_payload = params_map
             .remove("checkout")
-            .unwrap_or_else(|| Value::Object(params_map));
+            .unwrap_or(Value::Object(params_map));
 
         if let Some(obj) = checkout_payload.as_object_mut() {
             obj.entry("id".to_string())
@@ -1178,6 +1178,6 @@ mod tests {
     fn test_openrpc_schema() {
         let schema = openrpc_schema();
         assert_eq!(schema["openrpc"], "1.3.2");
-        assert!(schema["methods"].as_array().unwrap().len() > 0);
+        assert!(!schema["methods"].as_array().unwrap().is_empty());
     }
 }

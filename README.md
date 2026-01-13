@@ -1,5 +1,9 @@
 # StateSet UCP Handler (Rust)
 
+[![CI](https://github.com/stateset/stateset-ucp-handler/actions/workflows/ci.yml/badge.svg)](https://github.com/stateset/stateset-ucp-handler/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/stateset-ucp-handler.svg)](https://crates.io/crates/stateset-ucp-handler)
+[![License](https://img.shields.io/crates/l/stateset-ucp-handler.svg)](LICENSE)
+
 A standalone Rust server that implements the Universal Commerce Protocol (UCP) checkout flow.
 
 ## Features

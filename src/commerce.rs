@@ -26,7 +26,7 @@ impl CommerceEngine {
     ///
     /// # Arguments
     /// * `db_path` - Path to SQLite database file (created if not exists)
-    ///               Use ":memory:" for in-memory database (testing)
+    ///   Use ":memory:" for in-memory database (testing)
     ///
     /// # Example
     /// ```ignore

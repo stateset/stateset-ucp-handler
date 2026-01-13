@@ -181,9 +181,14 @@ impl OrderStore {
 
         // Extract tracking number from fulfillment events
         let tracking_number = order.fulfillment.events.as_ref().and_then(|events| {
-            events.iter().filter_map(|e| {
-                e.get("tracking_number").and_then(|v| v.as_str()).map(|s| s.to_string())
-            }).last()
+            events
+                .iter()
+                .filter_map(|e| {
+                    e.get("tracking_number")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+                .next_back()
         });
 
         let update = UpdateOrder {

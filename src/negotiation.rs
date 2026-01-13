@@ -205,8 +205,8 @@ fn parse_cache_control(header: Option<&reqwest::header::HeaderValue>) -> Option<
     let value = header?.to_str().ok()?;
     for part in value.split(',') {
         let part = part.trim();
-        if part.starts_with("max-age=") {
-            let seconds: u64 = part[8..].parse().ok()?;
+        if let Some(stripped) = part.strip_prefix("max-age=") {
+            let seconds: u64 = stripped.parse().ok()?;
             return Some(Duration::from_secs(seconds));
         }
     }

@@ -41,8 +41,6 @@ struct UcpOverlay {
     extra: HashMap<String, serde_json::Value>,
     /// Continue URL
     continue_url: Option<String>,
-    /// Expiration time
-    expires_at: Option<DateTime<Utc>>,
 }
 
 /// Hybrid checkout store with iCommerce persistence and in-memory UCP overlay
@@ -125,7 +123,6 @@ impl CheckoutStore {
                     messages: checkout.messages.clone(),
                     extra: checkout.extra.clone(),
                     continue_url: checkout.continue_url.clone(),
-                    expires_at,
                 },
             );
         }
