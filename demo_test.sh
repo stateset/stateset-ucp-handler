@@ -5,10 +5,18 @@ BASE_URL=${BASE_URL:-http://127.0.0.1:8081}
 API_KEY=${UCP_API_KEY:-}
 REQUEST_ID=${REQUEST_ID:-}
 IDEMPOTENCY_KEY=${IDEMPOTENCY_KEY:-}
+UCP_AGENT=${UCP_AGENT:-}
+REQUEST_SIGNATURE=${REQUEST_SIGNATURE:-}
 
 header_args=("-H" "Content-Type: application/json")
 if [[ -n "$API_KEY" ]]; then
   header_args+=("-H" "Authorization: Bearer ${API_KEY}")
+fi
+if [[ -n "$UCP_AGENT" ]]; then
+  header_args+=("-H" "UCP-Agent: ${UCP_AGENT}")
+fi
+if [[ -n "$REQUEST_SIGNATURE" ]]; then
+  header_args+=("-H" "Request-Signature: ${REQUEST_SIGNATURE}")
 fi
 if [[ -z "$REQUEST_ID" ]]; then
   REQUEST_ID=$(python - <<'PY'

@@ -65,6 +65,7 @@ impl A2AHandler {
             false,
             None,
             None,
+            None,
         );
 
         let handler = RustA2AHandler::new(checkout_service, config.base_url, config.ucp_version);

@@ -19,6 +19,7 @@ pub mod order_api;
 pub mod service;
 pub mod store;
 pub mod tokenization;
+pub mod ucp_meta;
 pub mod validation;
 pub mod webhook;
 

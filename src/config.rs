@@ -36,6 +36,8 @@ pub struct Config {
     pub oauth_service_documentation: Option<String>,
     pub token_ttl_seconds: u64,
     pub token_single_use: bool,
+    pub require_ucp_agent: bool,
+    pub require_request_signature: bool,
 }
 
 impl Config {
@@ -156,6 +158,10 @@ impl Config {
             .filter(|value| !value.is_empty())
             .collect::<Vec<_>>();
 
+        if oauth_enabled && oauth_redirect_uris.is_empty() {
+            return Err("OAuth requires UCP_OAUTH_REDIRECT_URIS to be configured".into());
+        }
+
         let oauth_service_documentation = std::env::var("UCP_OAUTH_SERVICE_DOCUMENTATION").ok();
 
         let token_ttl_seconds: u64 = std::env::var("UCP_TOKEN_TTL_SECONDS")
@@ -164,6 +170,16 @@ impl Config {
             .max(60);
 
         let token_single_use = std::env::var("UCP_TOKEN_SINGLE_USE")
+            .ok()
+            .map(|value| value == "true" || value == "1")
+            .unwrap_or(true);
+
+        let require_ucp_agent = std::env::var("UCP_REQUIRE_UCP_AGENT")
+            .ok()
+            .map(|value| value == "true" || value == "1")
+            .unwrap_or(true);
+
+        let require_request_signature = std::env::var("UCP_REQUIRE_REQUEST_SIGNATURE")
             .ok()
             .map(|value| value == "true" || value == "1")
             .unwrap_or(true);
@@ -203,6 +219,8 @@ impl Config {
             oauth_service_documentation,
             token_ttl_seconds,
             token_single_use,
+            require_ucp_agent,
+            require_request_signature,
         })
     }
 }

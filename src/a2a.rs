@@ -5,7 +5,9 @@
 
 use crate::errors::ServiceError;
 use crate::models::{CheckoutCompleteRequest, CheckoutCreateRequest, CheckoutUpdateRequest};
+use crate::negotiation::NegotiatedCapabilities;
 use crate::service::CheckoutService;
+use crate::ucp_meta::{apply_negotiated_checkout, requires_ap2_mandate};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -354,19 +356,31 @@ impl A2AHandler {
 
     /// Handle an A2A message
     pub async fn handle(&self, message: A2AMessage) -> A2AResponse {
+        self.handle_with_context(message, None).await
+    }
+
+    pub async fn handle_with_context(
+        &self,
+        message: A2AMessage,
+        negotiated: Option<&NegotiatedCapabilities>,
+    ) -> A2AResponse {
         if message.jsonrpc != "2.0" {
             return self.error_response(message.id, -32600, "Invalid JSON-RPC version");
         }
 
         match message.method.as_str() {
-            "tasks/send" => self.handle_send_task(message).await,
+            "tasks/send" => self.handle_send_task(message, negotiated).await,
             "tasks/get" => self.handle_get_task(message).await,
             "tasks/cancel" => self.handle_cancel_task(message).await,
             _ => self.error_response(message.id, -32601, &format!("Method not found: {}", message.method)),
         }
     }
 
-    async fn handle_send_task(&self, message: A2AMessage) -> A2AResponse {
+    async fn handle_send_task(
+        &self,
+        message: A2AMessage,
+        negotiated: Option<&NegotiatedCapabilities>,
+    ) -> A2AResponse {
         let params = message.params.unwrap_or(A2AParams {
             context_id: None,
             task_id: None,
@@ -412,11 +426,11 @@ impl A2AHandler {
         };
 
         let result = match operation.as_str() {
-            "create_checkout" => self.create_checkout(data).await,
-            "get_checkout" => self.get_checkout(data).await,
-            "update_checkout" => self.update_checkout(data).await,
-            "complete_checkout" => self.complete_checkout(data).await,
-            "cancel_checkout" => self.cancel_checkout(data).await,
+            "create_checkout" => self.create_checkout(data, negotiated).await,
+            "get_checkout" => self.get_checkout(data, negotiated).await,
+            "update_checkout" => self.update_checkout(data, negotiated).await,
+            "complete_checkout" => self.complete_checkout(data, negotiated).await,
+            "cancel_checkout" => self.cancel_checkout(data, negotiated).await,
             _ => Err(ServiceError::InvalidInput(format!("Unknown operation: {}", operation))),
         };
 
@@ -472,27 +486,41 @@ impl A2AHandler {
         }
     }
 
-    async fn create_checkout(&self, data: Option<Value>) -> Result<Value, ServiceError> {
+    async fn create_checkout(
+        &self,
+        data: Option<Value>,
+        negotiated: Option<&NegotiatedCapabilities>,
+    ) -> Result<Value, ServiceError> {
         let data = data.ok_or_else(|| ServiceError::InvalidInput("Missing data".to_string()))?;
         let request: CheckoutCreateRequest = serde_json::from_value(data)
             .map_err(|e| ServiceError::InvalidInput(format!("Invalid request: {}", e)))?;
-        let checkout = self.service.create_checkout(request).await?;
+        let mut checkout = self.service.create_checkout(request).await?;
+        apply_negotiated_checkout(&mut checkout, negotiated);
         serde_json::to_value(&checkout)
             .map_err(|e| ServiceError::External(format!("Serialization error: {}", e)))
     }
 
-    async fn get_checkout(&self, data: Option<Value>) -> Result<Value, ServiceError> {
+    async fn get_checkout(
+        &self,
+        data: Option<Value>,
+        negotiated: Option<&NegotiatedCapabilities>,
+    ) -> Result<Value, ServiceError> {
         let data = data.ok_or_else(|| ServiceError::InvalidInput("Missing data".to_string()))?;
         let checkout_id = data
             .get("checkout_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ServiceError::InvalidInput("Missing checkout_id".to_string()))?;
-        let checkout = self.service.get_checkout(checkout_id).await?;
+        let mut checkout = self.service.get_checkout(checkout_id).await?;
+        apply_negotiated_checkout(&mut checkout, negotiated);
         serde_json::to_value(&checkout)
             .map_err(|e| ServiceError::External(format!("Serialization error: {}", e)))
     }
 
-    async fn update_checkout(&self, data: Option<Value>) -> Result<Value, ServiceError> {
+    async fn update_checkout(
+        &self,
+        data: Option<Value>,
+        negotiated: Option<&NegotiatedCapabilities>,
+    ) -> Result<Value, ServiceError> {
         let data = data.ok_or_else(|| ServiceError::InvalidInput("Missing data".to_string()))?;
         let checkout_id = data
             .get("id")
@@ -501,12 +529,17 @@ impl A2AHandler {
             .to_string();
         let request: CheckoutUpdateRequest = serde_json::from_value(data)
             .map_err(|e| ServiceError::InvalidInput(format!("Invalid request: {}", e)))?;
-        let checkout = self.service.update_checkout(&checkout_id, request).await?;
+        let mut checkout = self.service.update_checkout(&checkout_id, request).await?;
+        apply_negotiated_checkout(&mut checkout, negotiated);
         serde_json::to_value(&checkout)
             .map_err(|e| ServiceError::External(format!("Serialization error: {}", e)))
     }
 
-    async fn complete_checkout(&self, data: Option<Value>) -> Result<Value, ServiceError> {
+    async fn complete_checkout(
+        &self,
+        data: Option<Value>,
+        negotiated: Option<&NegotiatedCapabilities>,
+    ) -> Result<Value, ServiceError> {
         let data = data.ok_or_else(|| ServiceError::InvalidInput("Missing data".to_string()))?;
         let checkout_id = data
             .get("checkout_id")
@@ -515,19 +548,29 @@ impl A2AHandler {
             .to_string();
         let request: CheckoutCompleteRequest = serde_json::from_value(data)
             .map_err(|e| ServiceError::InvalidInput(format!("Invalid request: {}", e)))?;
-        let checkout = self.service.complete_checkout(&checkout_id, request).await?;
+        let require_ap2 = requires_ap2_mandate(negotiated, self.service.ap2_enabled());
+        let mut checkout = self
+            .service
+            .complete_checkout_with_requirements(&checkout_id, request, require_ap2)
+            .await?;
+        apply_negotiated_checkout(&mut checkout, negotiated);
         serde_json::to_value(&checkout)
             .map_err(|e| ServiceError::External(format!("Serialization error: {}", e)))
     }
 
-    async fn cancel_checkout(&self, data: Option<Value>) -> Result<Value, ServiceError> {
+    async fn cancel_checkout(
+        &self,
+        data: Option<Value>,
+        negotiated: Option<&NegotiatedCapabilities>,
+    ) -> Result<Value, ServiceError> {
         let data = data.ok_or_else(|| ServiceError::InvalidInput("Missing data".to_string()))?;
         let checkout_id = data
             .get("checkout_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ServiceError::InvalidInput("Missing checkout_id".to_string()))?
             .to_string();
-        let checkout = self.service.cancel_checkout(&checkout_id).await?;
+        let mut checkout = self.service.cancel_checkout(&checkout_id).await?;
+        apply_negotiated_checkout(&mut checkout, negotiated);
         serde_json::to_value(&checkout)
             .map_err(|e| ServiceError::External(format!("Serialization error: {}", e)))
     }

@@ -587,7 +587,48 @@ pub fn sign_detached(payload: &[u8], key: &SigningKey) -> Result<DetachedJws, Cr
     let signature = match &key.inner {
         SigningKeyInner::P256(sk) => {
             // Hash with SHA-256 and sign
-            let digest = Sha256::digest(&signing_input);
+            let sig: P256Signature = sk.sign(&signing_input);
+            sig.to_bytes().to_vec()
+        }
+        SigningKeyInner::P384(sk) => {
+            let sig: P384Signature = sk.sign(&signing_input);
+            sig.to_bytes().to_vec()
+        }
+    };
+
+    let signature_b64 = URL_SAFE_NO_PAD.encode(&signature);
+
+    Ok(DetachedJws {
+        protected,
+        signature: signature_b64,
+    })
+}
+
+/// Creates a detached JWS signature over the given payload using base64url encoding.
+///
+/// This follows RFC 7515 Appendix F for detached payloads.
+pub fn sign_detached_b64(payload: &[u8], key: &SigningKey) -> Result<DetachedJws, CryptoError> {
+    let header = JwsHeader {
+        alg: key.algorithm.as_str().to_string(),
+        kid: Some(key.kid.clone()),
+        typ: Some("JWT".to_string()),
+        b64: None,
+        crit: None,
+    };
+
+    let header_json = serde_json::to_vec(&header)
+        .map_err(|e| CryptoError::JsonError(e.to_string()))?;
+
+    let protected = URL_SAFE_NO_PAD.encode(&header_json);
+    let payload_b64 = URL_SAFE_NO_PAD.encode(payload);
+
+    let mut signing_input = Vec::new();
+    signing_input.extend_from_slice(protected.as_bytes());
+    signing_input.push(b'.');
+    signing_input.extend_from_slice(payload_b64.as_bytes());
+
+    let signature = match &key.inner {
+        SigningKeyInner::P256(sk) => {
             let sig: P256Signature = sk.sign(&signing_input);
             sig.to_bytes().to_vec()
         }
@@ -613,6 +654,17 @@ pub fn verify_detached(
 ) -> Result<(), CryptoError> {
     // Parse and validate header
     let header = jws.header()?;
+    if header.b64 != Some(false)
+        || !header
+            .crit
+            .as_ref()
+            .map(|crit| crit.iter().any(|entry| entry == "b64"))
+            .unwrap_or(false)
+    {
+        return Err(CryptoError::InvalidSignatureFormat(
+            "Detached JWS must use b64=false with crit header".to_string(),
+        ));
+    }
 
     // Verify algorithm matches
     let alg = SigningAlgorithm::from_str(&header.alg)?;
@@ -645,6 +697,66 @@ pub fn verify_detached(
         .map_err(|e| CryptoError::Base64Error(e.to_string()))?;
 
     // Verify based on algorithm
+    match &key.inner {
+        VerifyingKeyInner::P256(vk) => {
+            let sig = P256Signature::from_bytes(sig_bytes.as_slice().into())
+                .map_err(|e| CryptoError::InvalidSignatureFormat(e.to_string()))?;
+
+            vk.verify(&signing_input, &sig)
+                .map_err(|_| CryptoError::VerificationFailed)?;
+        }
+        VerifyingKeyInner::P384(vk) => {
+            let sig = P384Signature::from_bytes(sig_bytes.as_slice().into())
+                .map_err(|e| CryptoError::InvalidSignatureFormat(e.to_string()))?;
+
+            vk.verify(&signing_input, &sig)
+                .map_err(|_| CryptoError::VerificationFailed)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Verifies a detached JWS signature using base64url-encoded payload.
+pub fn verify_detached_b64(
+    jws: &DetachedJws,
+    payload: &[u8],
+    key: &VerifyingKey,
+) -> Result<(), CryptoError> {
+    let header = jws.header()?;
+    if header.b64 == Some(false) {
+        return Err(CryptoError::InvalidSignatureFormat(
+            "Detached JWS uses unencoded payload".to_string(),
+        ));
+    }
+
+    let alg = SigningAlgorithm::from_str(&header.alg)?;
+    if alg != key.algorithm {
+        return Err(CryptoError::UnsupportedAlgorithm(format!(
+            "Key uses {:?} but JWS uses {}",
+            key.algorithm, header.alg
+        )));
+    }
+
+    if let Some(ref kid) = header.kid {
+        if kid != &key.kid {
+            return Err(CryptoError::KeyIdMismatch {
+                expected: key.kid.clone(),
+                actual: kid.clone(),
+            });
+        }
+    }
+
+    let payload_b64 = URL_SAFE_NO_PAD.encode(payload);
+    let mut signing_input = Vec::new();
+    signing_input.extend_from_slice(jws.protected.as_bytes());
+    signing_input.push(b'.');
+    signing_input.extend_from_slice(payload_b64.as_bytes());
+
+    let sig_bytes = URL_SAFE_NO_PAD
+        .decode(&jws.signature)
+        .map_err(|e| CryptoError::Base64Error(e.to_string()))?;
+
     match &key.inner {
         VerifyingKeyInner::P256(vk) => {
             let sig = P256Signature::from_bytes(sig_bytes.as_slice().into())
@@ -793,6 +905,16 @@ mod tests {
 
         let jws = sign_json(&value, &signing_key).unwrap();
         verify_json(&jws, &value, &verifying_key).unwrap();
+    }
+
+    #[test]
+    fn test_sign_verify_b64_roundtrip() {
+        let (signing_key, verifying_key) =
+            generate_key_pair(SigningAlgorithm::ES256, "test-key-b64".to_string());
+
+        let payload = br#"{"hello":"world"}"#;
+        let jws = sign_detached_b64(payload, &signing_key).unwrap();
+        verify_detached_b64(&jws, payload, &verifying_key).unwrap();
     }
 
     #[test]

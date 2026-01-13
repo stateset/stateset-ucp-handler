@@ -1,9 +1,9 @@
 use crate::catalog::ProductCatalog;
-use crate::crypto::{canonicalize, sign_detached, verify_detached, DetachedJws, SigningKey, VerifyingKey};
+use crate::crypto::{canonicalize, sign_detached_b64, SigningKey};
 use crate::errors::ServiceError;
 use crate::events::{Event, EventSender};
 use crate::models::{
-    AppliedDiscount, Ap2CheckoutResponse, CheckoutCompleteRequest, CheckoutCreateRequest,
+    AppliedDiscount, Ap2CheckoutResponse, Capability, CheckoutCompleteRequest, CheckoutCreateRequest,
     CheckoutResponse, CheckoutStatus, CheckoutUpdateRequest, DiscountAllocation, DiscountsObject,
     Fulfillment, FulfillmentAvailableMethod, FulfillmentGroup, FulfillmentMethod,
     FulfillmentOption, LineItemInput, LineItemResponse, Link, Message, Order, OrderConfirmation,
@@ -14,6 +14,7 @@ use crate::store::CheckoutStore;
 use crate::validation::{normalize_currency, validate_checkout_id, validate_quantity};
 use chrono::{Duration as ChronoDuration, Utc};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -24,6 +25,37 @@ const DISCOUNT_CAPABILITY: &str = "dev.ucp.shopping.discount";
 const AP2_MANDATE_CAPABILITY: &str = "dev.ucp.shopping.ap2_mandate";
 const IDENTITY_LINKING_CAPABILITY: &str = "dev.ucp.common.identity_linking";
 const BUYER_CONSENT_CAPABILITY: &str = "dev.ucp.shopping.buyer_consent";
+
+pub trait Ap2MandateVerifier: Send + Sync {
+    fn verify(&self, mandate: &str) -> Result<(), ServiceError>;
+}
+
+#[derive(Default)]
+pub struct FormatOnlyAp2MandateVerifier;
+
+impl Ap2MandateVerifier for FormatOnlyAp2MandateVerifier {
+    fn verify(&self, mandate: &str) -> Result<(), ServiceError> {
+        let trimmed = mandate.trim();
+        if trimmed.is_empty() {
+            return Err(ServiceError::InvalidInput(
+                "ap2.checkout_mandate is required".to_string(),
+            ));
+        }
+
+        let mut parts = trimmed.splitn(3, '.');
+        let header = parts.next().unwrap_or_default();
+        let payload = parts.next().unwrap_or_default();
+        let signature = parts.next().unwrap_or_default();
+
+        if header.is_empty() || payload.is_empty() || signature.is_empty() {
+            return Err(ServiceError::InvalidInput(
+                "ap2.checkout_mandate must be a detached JWS".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
 
 struct DiscountOutcome {
     discounts: Option<DiscountsObject>,
@@ -49,6 +81,7 @@ pub struct CheckoutService {
     ap2_enabled: bool,
     ap2_merchant_authorization: Option<String>,
     ap2_signing_key: Option<SigningKey>,
+    ap2_mandate_verifier: Arc<dyn Ap2MandateVerifier>,
 }
 
 impl CheckoutService {
@@ -67,6 +100,7 @@ impl CheckoutService {
         ap2_enabled: bool,
         ap2_merchant_authorization: Option<String>,
         ap2_signing_key: Option<SigningKey>,
+        ap2_mandate_verifier: Option<Arc<dyn Ap2MandateVerifier>>,
     ) -> Self {
         let handlers = vec![PaymentHandler {
             id: "ucp_card".to_string(),
@@ -110,6 +144,8 @@ impl CheckoutService {
             ap2_enabled,
             ap2_merchant_authorization,
             ap2_signing_key,
+            ap2_mandate_verifier: ap2_mandate_verifier
+                .unwrap_or_else(|| Arc::new(FormatOnlyAp2MandateVerifier::default())),
         }
     }
 
@@ -274,6 +310,16 @@ impl CheckoutService {
         checkout_id: &str,
         request: CheckoutCompleteRequest,
     ) -> Result<CheckoutResponse, ServiceError> {
+        self.complete_checkout_with_requirements(checkout_id, request, self.ap2_enabled)
+            .await
+    }
+
+    pub async fn complete_checkout_with_requirements(
+        &self,
+        checkout_id: &str,
+        request: CheckoutCompleteRequest,
+        require_ap2_mandate: bool,
+    ) -> Result<CheckoutResponse, ServiceError> {
         let mut checkout = self.get_checkout(checkout_id).await?;
 
         if matches!(checkout.status, CheckoutStatus::Completed) {
@@ -294,17 +340,13 @@ impl CheckoutService {
             ));
         }
 
-        if self.ap2_enabled {
+        if require_ap2_mandate {
             let mandate = request
                 .ap2
                 .as_ref()
-                .map(|ap2| ap2.checkout_mandate.trim())
-                .filter(|value| !value.is_empty());
-            if mandate.is_none() {
-                return Err(ServiceError::InvalidInput(
-                    "ap2.checkout_mandate is required".to_string(),
-                ));
-            }
+                .map(|ap2| ap2.checkout_mandate.as_str())
+                .unwrap_or_default();
+            self.ap2_mandate_verifier.verify(mandate)?;
         }
 
         self.attach_payment_data(&mut checkout, request.payment_data)?;
@@ -463,6 +505,18 @@ impl CheckoutService {
         }
     }
 
+    pub fn business_capabilities(&self) -> Vec<Capability> {
+        self.discovery_document().ucp.capabilities
+    }
+
+    pub fn business_version(&self) -> &str {
+        &self.ucp_version
+    }
+
+    pub fn ap2_enabled(&self) -> bool {
+        self.ap2_enabled
+    }
+
     fn response_meta(&self) -> UcpResponseMeta {
         self.response_meta_for(false, false, false, false)
     }
@@ -564,7 +618,7 @@ impl CheckoutService {
 
         // Canonicalize and sign
         let canonical = canonicalize(&checkout_value).ok()?;
-        let jws = sign_detached(&canonical, signing_key).ok()?;
+        let jws = sign_detached_b64(&canonical, signing_key).ok()?;
 
         Some(Ap2CheckoutResponse {
             merchant_authorization: jws.to_compact(),
@@ -1465,5 +1519,19 @@ impl CheckoutService {
         }
 
         options.first()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_only_ap2_verifier_checks_structure() {
+        let verifier = FormatOnlyAp2MandateVerifier::default();
+
+        assert!(verifier.verify("header.payload.signature").is_ok());
+        assert!(verifier.verify("missingdots").is_err());
+        assert!(verifier.verify("a.b").is_err());
     }
 }

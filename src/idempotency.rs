@@ -1,5 +1,5 @@
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::{Request, State},
     http::{header::CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
     middleware::Next,
@@ -28,6 +28,9 @@ pub struct IdempotencyStore {
     entries: Arc<RwLock<HashMap<String, IdempotencyRecord>>>,
     ttl: Duration,
 }
+
+#[derive(Clone, Debug)]
+pub struct CachedBody(pub Bytes);
 
 impl IdempotencyStore {
     pub fn new(ttl: Duration) -> Self {
@@ -116,24 +119,36 @@ pub async fn idempotency_middleware(
         return next.run(request).await;
     }
 
-    let (parts, body) = request.into_parts();
-    let body_bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            warn!("Failed to read request body: {}", err);
-            return (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                axum::Json(serde_json::json!({
-                    "type": "invalid_request",
-                    "code": "payload_too_large",
-                    "message": format!("Request body exceeds {} bytes", MAX_REQUEST_BODY_BYTES)
-                })),
-            )
-                .into_response();
-        }
+    let cached_body = request
+        .extensions()
+        .get::<CachedBody>()
+        .map(|cached| cached.0.clone());
+
+    let (mut parts, body) = request.into_parts();
+    let body_bytes = match cached_body {
+        Some(bytes) => bytes,
+        None => match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
+            Ok(bytes) => {
+                parts.extensions.insert(CachedBody(bytes.clone()));
+                bytes
+            }
+            Err(err) => {
+                warn!("Failed to read request body: {}", err);
+                return (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    axum::Json(serde_json::json!({
+                        "type": "invalid_request",
+                        "code": "payload_too_large",
+                        "message": format!("Request body exceeds {} bytes", MAX_REQUEST_BODY_BYTES)
+                    })),
+                )
+                    .into_response();
+            }
+        },
     };
 
-    let request_hash = IdempotencyStore::compute_request_hash(&parts.method, &parts.uri, &body_bytes);
+    let request_hash =
+        IdempotencyStore::compute_request_hash(&parts.method, &parts.uri, &body_bytes);
 
     if let Some(record) = store.get(&idempotency_key).await {
         if record.request_hash != request_hash {

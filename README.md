@@ -32,9 +32,13 @@ Run the demo flow:
 ./demo_test.sh
 ```
 
-### Request Headers (when enabled)
+### Request Headers
 
-If you enable header enforcement, include these on requests:
+By default, the handler requires `UCP-Agent` on all requests and
+`Request-Signature` on `POST`/`PUT`. You can relax this for local testing with
+`UCP_REQUIRE_UCP_AGENT=false` and `UCP_REQUIRE_REQUEST_SIGNATURE=false`.
+
+Additional headers when enabled:
 
 - `Request-Id` on all calls when `UCP_REQUIRE_REQUEST_ID=true`.
 - `Idempotency-Key` on POST/PUT when `UCP_REQUIRE_IDEMPOTENCY=true`.
@@ -43,6 +47,8 @@ If you enable header enforcement, include these on requests:
 
 ```bash
 curl -X POST http://localhost:8081/api/checkout-sessions \
+  -H "UCP-Agent: profile=\"https://platform.example/profile\"" \
+  -H "Request-Signature: <detached-jws>" \
   -H "Request-Id: 00000000-0000-0000-0000-000000000001" \
   -H "Idempotency-Key: 00000000-0000-0000-0000-000000000002" \
   -H "Content-Type: application/json" \
@@ -91,6 +97,8 @@ curl -X POST http://localhost:8081/api/checkout-sessions \
 
 ```bash
 curl -X POST http://localhost:8081/api/checkout-sessions/{id}/complete \
+  -H "UCP-Agent: profile=\"https://platform.example/profile\"" \
+  -H "Request-Signature: <detached-jws>" \
   -H "Request-Id: 00000000-0000-0000-0000-000000000003" \
   -H "Idempotency-Key: 00000000-0000-0000-0000-000000000004" \
   -H "Content-Type: application/json" \
@@ -187,10 +195,13 @@ The proto definition lives at `proto/ucp_handler/v1/ucp_handler.proto`.
 | `UCP_REQUIRE_AUTH` | `false` | Require auth headers |
 | `UCP_REQUIRE_IDEMPOTENCY` | `false` | Require idempotency headers |
 | `UCP_REQUIRE_REQUEST_ID` | `false` | Require Request-Id header |
+| `UCP_REQUIRE_UCP_AGENT` | `true` | Require UCP-Agent header |
+| `UCP_REQUIRE_REQUEST_SIGNATURE` | `true` | Require Request-Signature on POST/PUT |
 | `UCP_ORDER_WEBHOOK_URL` | _unset_ | Platform webhook URL for order events |
 | `UCP_ORDER_WEBHOOK_API_KEY` | _unset_ | API key sent to the platform webhook |
 | `UCP_WEBHOOK_SIGNATURE` | _unset_ | Static `Request-Signature` header value for webhooks |
 | `UCP_SIGNING_KEYS_JSON` | _unset_ | JSON array of JWKs advertised in discovery |
+| `UCP_SIGNING_PRIVATE_KEY_JSON` | _unset_ | JWK private key for AP2 + response signing |
 | `UCP_BUYER_CONSENT_ENABLED` | `false` | Advertise buyer consent extension support |
 | `UCP_AP2_ENABLED` | `false` | Enable AP2 mandate extension |
 | `UCP_AP2_MERCHANT_AUTH` | _unset_ | Detached JWS signature for AP2 merchant authorization |
@@ -198,6 +209,7 @@ The proto definition lives at `proto/ucp_handler/v1/ucp_handler.proto`.
 | `UCP_OAUTH_ISSUER` | `http://127.0.0.1:8081` | Issuer URL for OAuth metadata |
 | `UCP_OAUTH_CLIENT_ID` | `ucp-demo-client` | OAuth client identifier |
 | `UCP_OAUTH_CLIENT_SECRET` | `ucp-demo-secret` | OAuth client secret |
+| `UCP_OAUTH_REDIRECT_URIS` | _unset_ | Comma-separated OAuth redirect URIs (required when OAuth enabled) |
 | `UCP_OAUTH_SCOPES` | `ucp:scopes:checkout_session` | Space- or comma-separated OAuth scopes |
 | `UCP_OAUTH_TOKEN_TTL_SECONDS` | `3600` | OAuth access token TTL (seconds) |
 | `UCP_OAUTH_CODE_TTL_SECONDS` | `300` | OAuth authorization code TTL (seconds) |

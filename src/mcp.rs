@@ -4,10 +4,10 @@
 //! All checkout operations are exposed via JSON-RPC 2.0 methods.
 
 use crate::errors::ServiceError;
-use crate::models::{
-    CheckoutCompleteRequest, CheckoutCreateRequest, CheckoutResponse, CheckoutUpdateRequest,
-};
+use crate::models::{CheckoutCompleteRequest, CheckoutCreateRequest, CheckoutUpdateRequest};
+use crate::negotiation::NegotiatedCapabilities;
 use crate::service::CheckoutService;
+use crate::ucp_meta::{apply_negotiated_checkout, requires_ap2_mandate};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, warn};
@@ -87,6 +87,14 @@ impl McpHandler {
 
     /// Handles a JSON-RPC request and returns a response
     pub async fn handle(&self, request: JsonRpcRequest) -> JsonRpcResponse {
+        self.handle_with_context(request, None).await
+    }
+
+    pub async fn handle_with_context(
+        &self,
+        request: JsonRpcRequest,
+        negotiated: Option<&NegotiatedCapabilities>,
+    ) -> JsonRpcResponse {
         // Validate JSON-RPC version
         if request.jsonrpc != "2.0" {
             return self.error_response(
@@ -102,15 +110,15 @@ impl McpHandler {
 
         // Route to appropriate handler
         match request.method.as_str() {
-            "ucp/checkout/create" => self.create_checkout(request).await,
-            "ucp/checkout/get" => self.get_checkout(request).await,
-            "ucp/checkout/update" => self.update_checkout(request).await,
-            "ucp/checkout/complete" => self.complete_checkout(request).await,
-            "ucp/checkout/cancel" => self.cancel_checkout(request).await,
+            "ucp/checkout/create" => self.create_checkout(request, negotiated).await,
+            "ucp/checkout/get" => self.get_checkout(request, negotiated).await,
+            "ucp/checkout/update" => self.update_checkout(request, negotiated).await,
+            "ucp/checkout/complete" => self.complete_checkout(request, negotiated).await,
+            "ucp/checkout/cancel" => self.cancel_checkout(request, negotiated).await,
             // MCP standard methods
             "initialize" => self.initialize(request).await,
             "tools/list" => self.list_tools(request).await,
-            "tools/call" => self.call_tool(request).await,
+            "tools/call" => self.call_tool(request, negotiated).await,
             _ => self.error_response(
                 request.id,
                 error_codes::METHOD_NOT_FOUND,
@@ -140,7 +148,11 @@ impl McpHandler {
         })
     }
 
-    async fn create_checkout(&self, request: JsonRpcRequest) -> JsonRpcResponse {
+    async fn create_checkout(
+        &self,
+        request: JsonRpcRequest,
+        negotiated: Option<&NegotiatedCapabilities>,
+    ) -> JsonRpcResponse {
         let params = self.strip_meta(request.params);
         let Some(params) = params else {
             return self.error_response(
@@ -164,12 +176,19 @@ impl McpHandler {
         };
 
         match self.service.create_checkout(create_request).await {
-            Ok(checkout) => self.success_response(request.id, &checkout),
+            Ok(mut checkout) => {
+                apply_negotiated_checkout(&mut checkout, negotiated);
+                self.success_response(request.id, &checkout)
+            }
             Err(e) => self.service_error_response(request.id, e),
         }
     }
 
-    async fn get_checkout(&self, request: JsonRpcRequest) -> JsonRpcResponse {
+    async fn get_checkout(
+        &self,
+        request: JsonRpcRequest,
+        negotiated: Option<&NegotiatedCapabilities>,
+    ) -> JsonRpcResponse {
         let checkout_id = self.extract_checkout_id(&request.params);
         let Some(checkout_id) = checkout_id else {
             return self.error_response(
@@ -181,12 +200,19 @@ impl McpHandler {
         };
 
         match self.service.get_checkout(&checkout_id).await {
-            Ok(checkout) => self.success_response(request.id, &checkout),
+            Ok(mut checkout) => {
+                apply_negotiated_checkout(&mut checkout, negotiated);
+                self.success_response(request.id, &checkout)
+            }
             Err(e) => self.service_error_response(request.id, e),
         }
     }
 
-    async fn update_checkout(&self, request: JsonRpcRequest) -> JsonRpcResponse {
+    async fn update_checkout(
+        &self,
+        request: JsonRpcRequest,
+        negotiated: Option<&NegotiatedCapabilities>,
+    ) -> JsonRpcResponse {
         let params = self.strip_meta(request.params);
         let Some(params) = params else {
             return self.error_response(
@@ -223,12 +249,19 @@ impl McpHandler {
         };
 
         match self.service.update_checkout(&checkout_id, update_request).await {
-            Ok(checkout) => self.success_response(request.id, &checkout),
+            Ok(mut checkout) => {
+                apply_negotiated_checkout(&mut checkout, negotiated);
+                self.success_response(request.id, &checkout)
+            }
             Err(e) => self.service_error_response(request.id, e),
         }
     }
 
-    async fn complete_checkout(&self, request: JsonRpcRequest) -> JsonRpcResponse {
+    async fn complete_checkout(
+        &self,
+        request: JsonRpcRequest,
+        negotiated: Option<&NegotiatedCapabilities>,
+    ) -> JsonRpcResponse {
         let params = self.strip_meta(request.params);
         let Some(params) = params else {
             return self.error_response(
@@ -265,13 +298,25 @@ impl McpHandler {
             }
         };
 
-        match self.service.complete_checkout(&checkout_id, complete_request).await {
-            Ok(checkout) => self.success_response(request.id, &checkout),
+        let require_ap2 = requires_ap2_mandate(negotiated, self.service.ap2_enabled());
+        match self
+            .service
+            .complete_checkout_with_requirements(&checkout_id, complete_request, require_ap2)
+            .await
+        {
+            Ok(mut checkout) => {
+                apply_negotiated_checkout(&mut checkout, negotiated);
+                self.success_response(request.id, &checkout)
+            }
             Err(e) => self.service_error_response(request.id, e),
         }
     }
 
-    async fn cancel_checkout(&self, request: JsonRpcRequest) -> JsonRpcResponse {
+    async fn cancel_checkout(
+        &self,
+        request: JsonRpcRequest,
+        negotiated: Option<&NegotiatedCapabilities>,
+    ) -> JsonRpcResponse {
         let checkout_id = self.extract_checkout_id(&request.params);
         let Some(checkout_id) = checkout_id else {
             return self.error_response(
@@ -283,7 +328,10 @@ impl McpHandler {
         };
 
         match self.service.cancel_checkout(&checkout_id).await {
-            Ok(checkout) => self.success_response(request.id, &checkout),
+            Ok(mut checkout) => {
+                apply_negotiated_checkout(&mut checkout, negotiated);
+                self.success_response(request.id, &checkout)
+            }
             Err(e) => self.service_error_response(request.id, e),
         }
     }
@@ -404,7 +452,11 @@ impl McpHandler {
     }
 
     /// MCP tools/call method - execute a tool
-    async fn call_tool(&self, request: JsonRpcRequest) -> JsonRpcResponse {
+    async fn call_tool(
+        &self,
+        request: JsonRpcRequest,
+        negotiated: Option<&NegotiatedCapabilities>,
+    ) -> JsonRpcResponse {
         let params = request.params.as_ref();
         let tool_name = params
             .and_then(|p| p.get("name"))
@@ -432,11 +484,11 @@ impl McpHandler {
 
         // Execute the method directly (not through handle to avoid recursion)
         let response = match tool_name {
-            "ucp_checkout_create" => self.create_checkout(synthetic_request).await,
-            "ucp_checkout_get" => self.get_checkout(synthetic_request).await,
-            "ucp_checkout_update" => self.update_checkout(synthetic_request).await,
-            "ucp_checkout_complete" => self.complete_checkout(synthetic_request).await,
-            "ucp_checkout_cancel" => self.cancel_checkout(synthetic_request).await,
+            "ucp_checkout_create" => self.create_checkout(synthetic_request, negotiated).await,
+            "ucp_checkout_get" => self.get_checkout(synthetic_request, negotiated).await,
+            "ucp_checkout_update" => self.update_checkout(synthetic_request, negotiated).await,
+            "ucp_checkout_complete" => self.complete_checkout(synthetic_request, negotiated).await,
+            "ucp_checkout_cancel" => self.cancel_checkout(synthetic_request, negotiated).await,
             _ => {
                 return self.error_response(
                     request.id,

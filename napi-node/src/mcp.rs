@@ -65,6 +65,7 @@ impl McpHandler {
             false,
             None,
             None,
+            None,
         );
 
         let handler = RustMcpHandler::new(checkout_service);

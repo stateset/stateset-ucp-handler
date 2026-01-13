@@ -78,6 +78,7 @@ impl CheckoutService {
             config.ap2_enabled.unwrap_or(false),
             config.ap2_merchant_authorization,
             None, // ap2_signing_key
+            None, // ap2_mandate_verifier
         );
 
         Self {

@@ -1,6 +1,7 @@
 use axum::{
-    extract::{Form, Path, Query, Request, State},
-    http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
+    body::Body,
+    extract::{Extension, Form, Path, Query, Request, State},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -31,6 +32,7 @@ mod order_api;
 mod service;
 mod store;
 mod tokenization;
+mod ucp_meta;
 mod validation;
 mod webhook;
 
@@ -38,17 +40,20 @@ use a2a::{A2AHandler, A2AMessage};
 use auth::{auth_middleware, AuthConfig};
 use config::Config;
 use constants::MAX_REQUEST_BODY_BYTES;
-use crypto::{load_signing_key_from_private, JwkPrivateKey};
+use crypto::{
+    canonicalize, load_signing_key_from_private, sign_detached, verify_detached, DetachedJws,
+    JwkPrivateKey, SigningKey,
+};
 use embedded::{EmbeddedHandler, EmbeddedParams};
 use errors::ApiError;
 use events::{Event, EventSender};
-use idempotency::{idempotency_middleware, IdempotencyStore};
+use idempotency::{idempotency_middleware, CachedBody, IdempotencyStore};
 use mcp::{JsonRpcRequest, McpHandler};
 use models::{
-    CheckoutCompleteRequest, CheckoutCreateRequest, CheckoutUpdateRequest, DetokenizeRequest,
-    OrderEvent, TokenizeRequest,
+    Capability, CheckoutCompleteRequest, CheckoutCreateRequest, CheckoutUpdateRequest,
+    DetokenizeRequest, OrderEvent, TokenizeRequest,
 };
-use negotiation::ProfileCache;
+use negotiation::{negotiate, NegotiatedCapabilities, NegotiationError, ProfileCache};
 use oauth::{
     build_redirect_uri, parse_basic_auth, AuthorizationRequest, OAuthConfig, OAuthService,
     RevocationRequest, TokenRequest,
@@ -56,6 +61,7 @@ use oauth::{
 use service::CheckoutService;
 use store::CheckoutStore;
 use tokenization::TokenizationService;
+use ucp_meta::{apply_negotiated_checkout, requires_ap2_mandate};
 use webhook::OrderWebhook;
 use tower_http::{
     compression::CompressionLayer, cors::CorsLayer, limit::RequestBodyLimitLayer,
@@ -69,12 +75,17 @@ pub struct AppState {
     idempotency: Option<Arc<IdempotencyStore>>,
     require_idempotency: bool,
     require_request_id: bool,
+    require_ucp_agent: bool,
+    require_request_signature: bool,
     oauth: Option<Arc<OAuthService>>,
     tokenization: Arc<TokenizationService>,
     profile_cache: Arc<ProfileCache>,
     mcp_handler: Arc<McpHandler>,
     a2a_handler: Arc<A2AHandler>,
     embedded_handler: Arc<EmbeddedHandler>,
+    response_signing_key: Option<Arc<SigningKey>>,
+    business_capabilities: Arc<Vec<Capability>>,
+    business_version: String,
 }
 
 impl AppState {
@@ -97,6 +108,11 @@ impl axum::extract::FromRef<AppState> for Option<Arc<IdempotencyStore>> {
     fn from_ref(state: &AppState) -> Option<Arc<IdempotencyStore>> {
         state.idempotency.clone()
     }
+}
+
+#[derive(Clone)]
+struct UcpRequestContext {
+    negotiated: NegotiatedCapabilities,
 }
 
 #[tokio::main]
@@ -150,6 +166,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(config.oauth_redirect_uris.iter().cloned().collect())
     };
 
+    let response_signing_key = ap2_signing_key.clone().map(Arc::new);
+
     let oauth_service = if config.oauth_enabled {
         Some(Arc::new(OAuthService::new(OAuthConfig {
             issuer: config.oauth_issuer.clone(),
@@ -180,6 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.ap2_enabled,
         config.ap2_merchant_authorization.clone(),
         ap2_signing_key,
+        None,
     );
 
     let auth = Arc::new(AuthConfig::new(
@@ -192,6 +211,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Duration::from_secs(config.token_ttl_seconds),
         config.token_single_use,
     ));
+    let business_capabilities = Arc::new(service.business_capabilities());
+    let business_version = service.business_version().to_string();
 
     let idempotency_store = if config.require_idempotency || !config.api_keys.is_empty() {
         Some(Arc::new(IdempotencyStore::new(std::time::Duration::from_secs(
@@ -226,12 +247,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         idempotency: idempotency_store,
         require_idempotency: config.require_idempotency,
         require_request_id: config.require_request_id,
+        require_ucp_agent: config.require_ucp_agent,
+        require_request_signature: config.require_request_signature,
         oauth: oauth_service.clone(),
         tokenization,
         profile_cache,
         mcp_handler,
         a2a_handler,
         embedded_handler,
+        response_signing_key,
+        business_capabilities,
+        business_version,
     };
 
     let webhook_sender = OrderWebhook::new(
@@ -271,6 +297,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_headers_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            request_signature_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            ucp_agent_middleware,
         ));
 
     let tokenization_router = Router::new()
@@ -315,6 +349,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .layer(middleware::from_fn_with_state(
                     state.clone(),
                     require_headers_middleware,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    ucp_agent_middleware,
                 )),
         )
         .route("/schemas/shopping/mcp.openrpc.json", get(mcp_schema));
@@ -334,6 +372,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .layer(middleware::from_fn_with_state(
                     state.clone(),
                     require_headers_middleware,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    ucp_agent_middleware,
                 )),
         );
     app = app.merge(a2a_router);
@@ -416,74 +458,118 @@ async fn discovery(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn create_checkout(
     State(state): State<AppState>,
+    Extension(context): Extension<UcpRequestContext>,
     headers: HeaderMap,
     Json(payload): Json<CheckoutCreateRequest>,
 ) -> Result<Response, ApiError> {
-    let checkout = state
+    let mut checkout = state
         .service
         .create_checkout(payload)
         .await
         .map_err(ApiError::from_service)?;
 
-    build_json_response(StatusCode::CREATED, &checkout, &headers)
+    apply_negotiated_checkout(&mut checkout, Some(&context.negotiated));
+
+    build_json_response(
+        StatusCode::CREATED,
+        &checkout,
+        &headers,
+        state.response_signing_key.as_deref(),
+    )
 }
 
 async fn get_checkout(
     State(state): State<AppState>,
+    Extension(context): Extension<UcpRequestContext>,
     headers: HeaderMap,
     Path(checkout_id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let checkout = state
+    let mut checkout = state
         .service
         .get_checkout(&checkout_id)
         .await
         .map_err(ApiError::from_service)?;
 
-    build_json_response(StatusCode::OK, &checkout, &headers)
+    apply_negotiated_checkout(&mut checkout, Some(&context.negotiated));
+
+    build_json_response(
+        StatusCode::OK,
+        &checkout,
+        &headers,
+        state.response_signing_key.as_deref(),
+    )
 }
 
 async fn update_checkout(
     State(state): State<AppState>,
+    Extension(context): Extension<UcpRequestContext>,
     headers: HeaderMap,
     Path(checkout_id): Path<String>,
     Json(payload): Json<CheckoutUpdateRequest>,
 ) -> Result<Response, ApiError> {
-    let checkout = state
+    let mut checkout = state
         .service
         .update_checkout(&checkout_id, payload)
         .await
         .map_err(ApiError::from_service)?;
 
-    build_json_response(StatusCode::OK, &checkout, &headers)
+    apply_negotiated_checkout(&mut checkout, Some(&context.negotiated));
+
+    build_json_response(
+        StatusCode::OK,
+        &checkout,
+        &headers,
+        state.response_signing_key.as_deref(),
+    )
 }
 
 async fn complete_checkout(
     State(state): State<AppState>,
+    Extension(context): Extension<UcpRequestContext>,
     headers: HeaderMap,
     Path(checkout_id): Path<String>,
     Json(payload): Json<CheckoutCompleteRequest>,
 ) -> Result<Response, ApiError> {
-    let checkout = state
+    let require_ap2 = requires_ap2_mandate(
+        Some(&context.negotiated),
+        state.service.ap2_enabled(),
+    );
+    let mut checkout = state
         .service
-        .complete_checkout(&checkout_id, payload)
+        .complete_checkout_with_requirements(&checkout_id, payload, require_ap2)
         .await
         .map_err(ApiError::from_service)?;
 
-    build_json_response(StatusCode::OK, &checkout, &headers)
+    apply_negotiated_checkout(&mut checkout, Some(&context.negotiated));
+
+    build_json_response(
+        StatusCode::OK,
+        &checkout,
+        &headers,
+        state.response_signing_key.as_deref(),
+    )
 }
 
 async fn cancel_checkout(
     State(state): State<AppState>,
+    Extension(context): Extension<UcpRequestContext>,
     headers: HeaderMap,
     Path(checkout_id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let checkout = state
+    let mut checkout = state
         .service
         .cancel_checkout(&checkout_id)
         .await
         .map_err(ApiError::from_service)?;
 
-    build_json_response(StatusCode::OK, &checkout, &headers)
+    apply_negotiated_checkout(&mut checkout, Some(&context.negotiated));
+
+    build_json_response(
+        StatusCode::OK,
+        &checkout,
+        &headers,
+        state.response_signing_key.as_deref(),
+    )
 }
 
 async fn tokenize(
@@ -497,7 +583,12 @@ async fn tokenize(
         .await
         .map_err(ApiError::from_service)?;
 
-    build_json_response(StatusCode::OK, &response, &headers)
+    build_json_response(
+        StatusCode::OK,
+        &response,
+        &headers,
+        state.response_signing_key.as_deref(),
+    )
 }
 
 async fn detokenize(
@@ -511,7 +602,12 @@ async fn detokenize(
         .await
         .map_err(ApiError::from_service)?;
 
-    build_json_response(StatusCode::OK, &credential, &headers)
+    build_json_response(
+        StatusCode::OK,
+        &credential,
+        &headers,
+        state.response_signing_key.as_deref(),
+    )
 }
 
 async fn oauth_metadata(State(state): State<AppState>) -> Response {
@@ -593,6 +689,148 @@ async fn oauth_revoke(
     StatusCode::OK.into_response()
 }
 
+async fn ucp_agent_middleware(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    if request.method() == Method::OPTIONS {
+        return next.run(request).await;
+    }
+    let header_value = match headers.get("UCP-Agent") {
+        Some(value) => match value.to_str() {
+            Ok(raw) => Some(raw),
+            Err(_) => {
+                return json_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_ucp_agent",
+                    "UCP-Agent header must be valid ASCII",
+                )
+            }
+        },
+        None => {
+            if state.require_ucp_agent {
+                return json_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "missing_ucp_agent",
+                    "UCP-Agent header is required",
+                );
+            }
+            None
+        }
+    };
+
+    let negotiated = match negotiate(
+        header_value,
+        state.business_capabilities.as_ref(),
+        &state.business_version,
+        state.profile_cache.as_ref(),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(err) => return negotiation_error_response(err),
+    };
+
+    request
+        .extensions_mut()
+        .insert(UcpRequestContext { negotiated });
+
+    next.run(request).await
+}
+
+async fn request_signature_middleware(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: Request,
+    next: Next,
+) -> Response {
+    let method = request.method().clone();
+    if method != Method::POST && method != Method::PUT {
+        return next.run(request).await;
+    }
+
+    let signature_header = headers.get("Request-Signature").and_then(|value| {
+        value
+            .to_str()
+            .ok()
+            .map(|raw| raw.trim())
+            .filter(|raw| !raw.is_empty())
+    });
+
+    if signature_header.is_none() && !state.require_request_signature {
+        return next.run(request).await;
+    }
+
+    let signature = match signature_header {
+        Some(value) => value,
+        None => {
+            return json_error_response(
+                StatusCode::BAD_REQUEST,
+                "missing_request_signature",
+                "Request-Signature header is required",
+            )
+        }
+    };
+
+    let cached_body = request
+        .extensions()
+        .get::<CachedBody>()
+        .map(|cached| cached.0.clone());
+
+    let (mut parts, body) = request.into_parts();
+    let body_bytes = match cached_body {
+        Some(bytes) => bytes,
+        None => match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
+            Ok(bytes) => {
+                parts.extensions.insert(CachedBody(bytes.clone()));
+                bytes
+            }
+            Err(err) => {
+                warn!("Failed to read request body: {}", err);
+                return json_error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "payload_too_large",
+                    &format!("Request body exceeds {} bytes", MAX_REQUEST_BODY_BYTES),
+                );
+            }
+        },
+    };
+
+    let context = parts.extensions.get::<UcpRequestContext>().cloned();
+    let Some(context) = context else {
+        return json_error_response(
+            StatusCode::BAD_REQUEST,
+            "missing_ucp_agent",
+            "UCP-Agent negotiation is required for request signatures",
+        );
+    };
+
+    if context.negotiated.platform_signing_keys.is_empty() {
+        return json_error_response(
+            StatusCode::BAD_REQUEST,
+            "signature_keys_unavailable",
+            "Platform signing keys are required to verify Request-Signature",
+        );
+    }
+
+    if let Err(message) = verify_request_signature(
+        signature,
+        &body_bytes,
+        &context.negotiated.platform_signing_keys,
+    ) {
+        return json_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_signature",
+            &message,
+        );
+    }
+
+    let request = Request::from_parts(parts, Body::from(body_bytes));
+    next.run(request).await
+}
+
 async fn require_headers_middleware(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -631,6 +869,85 @@ async fn require_headers_middleware(
     next.run(request).await
 }
 
+fn verify_request_signature(
+    signature: &str,
+    payload: &[u8],
+    keys: &[crypto::VerifyingKey],
+) -> Result<(), String> {
+    let jws = DetachedJws::from_compact(signature)
+        .map_err(|err| format!("Invalid detached JWS: {}", err))?;
+    let header = jws
+        .header()
+        .map_err(|err| format!("Invalid JWS header: {}", err))?;
+
+    let candidates: Vec<&crypto::VerifyingKey> = match header.kid.as_deref() {
+        Some(kid) => keys.iter().filter(|key| key.kid == kid).collect(),
+        None => keys.iter().collect(),
+    };
+
+    if candidates.is_empty() {
+        return Err("No matching signing key found for Request-Signature".to_string());
+    }
+
+    for key in candidates {
+        if verify_detached(&jws, payload, key).is_ok() {
+            return Ok(());
+        }
+    }
+
+    Err("Request-Signature verification failed".to_string())
+}
+
+fn negotiation_error_response(err: NegotiationError) -> Response {
+    match err {
+        NegotiationError::MissingUcpAgentHeader => json_error_response(
+            StatusCode::BAD_REQUEST,
+            "missing_ucp_agent",
+            "UCP-Agent header is required",
+        ),
+        NegotiationError::InvalidUcpAgentFormat(message) => json_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_ucp_agent",
+            &format!("Invalid UCP-Agent header: {}", message),
+        ),
+        NegotiationError::MissingProfileUrl => json_error_response(
+            StatusCode::BAD_REQUEST,
+            "missing_profile",
+            "UCP-Agent profile is required",
+        ),
+        NegotiationError::VersionNotSupported {
+            platform_version,
+            business_version,
+        } => json_error_response(
+            StatusCode::BAD_REQUEST,
+            "version_not_supported",
+            &format!(
+                "Platform version {} is newer than business version {}",
+                platform_version, business_version
+            ),
+        ),
+        NegotiationError::ProfileFetchError(message)
+        | NegotiationError::InvalidProfile(message)
+        | NegotiationError::HttpError(message) => json_error_response(
+            StatusCode::BAD_GATEWAY,
+            "profile_unavailable",
+            &message,
+        ),
+    }
+}
+
+fn json_error_response(status: StatusCode, code: &str, message: &str) -> Response {
+    (
+        status,
+        Json(serde_json::json!({
+            "type": "invalid_request",
+            "code": code,
+            "message": message
+        })),
+    )
+        .into_response()
+}
+
 fn oauth_unavailable() -> Response {
     (
         StatusCode::NOT_FOUND,
@@ -646,10 +963,26 @@ fn build_json_response<T: Serialize>(
     status: StatusCode,
     body: &T,
     request_headers: &HeaderMap,
+    signing_key: Option<&SigningKey>,
 ) -> Result<Response, ApiError> {
-    let json_body = serde_json::to_vec(body).map_err(|err| {
+    let json_value = serde_json::to_value(body).map_err(|err| {
         warn!("Failed to serialize response: {}", err);
-        ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "serialization_error", "Failed to serialize response", None)
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "serialization_error",
+            "Failed to serialize response",
+            None,
+        )
+    })?;
+
+    let json_body = serde_json::to_vec(&json_value).map_err(|err| {
+        warn!("Failed to serialize response: {}", err);
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "serialization_error",
+            "Failed to serialize response",
+            None,
+        )
     })?;
 
     let mut response = Response::builder()
@@ -681,15 +1014,44 @@ fn build_json_response<T: Serialize>(
         );
     }
 
+    if let Some(signing_key) = signing_key {
+        let canonical = canonicalize(&json_value).map_err(|err| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "response_signing_failed",
+                &format!("Failed to canonicalize response: {}", err),
+                None,
+            )
+        })?;
+
+        let jws = sign_detached(&canonical, signing_key).map_err(|err| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "response_signing_failed",
+                &format!("Failed to sign response: {}", err),
+                None,
+            )
+        })?;
+
+        response_headers.insert(
+            HeaderName::from_static("x-detached-jwt"),
+            HeaderValue::from_str(&jws.to_compact()).unwrap_or(HeaderValue::from_static("")),
+        );
+    }
+
     Ok(response)
 }
 
 /// MCP JSON-RPC 2.0 endpoint handler
 async fn mcp_handler_endpoint(
     State(state): State<AppState>,
+    Extension(context): Extension<UcpRequestContext>,
     Json(request): Json<JsonRpcRequest>,
 ) -> impl IntoResponse {
-    let response = state.mcp_handler.handle(request).await;
+    let response = state
+        .mcp_handler
+        .handle_with_context(request, Some(&context.negotiated))
+        .await;
     (StatusCode::OK, Json(response))
 }
 
@@ -708,9 +1070,13 @@ async fn agent_card(State(state): State<AppState>) -> impl IntoResponse {
 /// A2A message handler endpoint
 async fn a2a_handler_endpoint(
     State(state): State<AppState>,
+    Extension(context): Extension<UcpRequestContext>,
     Json(message): Json<A2AMessage>,
 ) -> impl IntoResponse {
-    let response = state.a2a_handler.handle(message).await;
+    let response = state
+        .a2a_handler
+        .handle_with_context(message, Some(&context.negotiated))
+        .await;
     (StatusCode::OK, Json(response))
 }
 
