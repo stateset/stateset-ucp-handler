@@ -13,7 +13,9 @@ A standalone Rust server that implements the Universal Commerce Protocol (UCP) c
 - AP2 mandate extension (optional embedded authorization)
 - Tokenization handler endpoints (`/tokenize`, `/detokenize`)
 - gRPC server (JSON payloads) with health + reflection
-- In-memory storage with TTL
+- **iCommerce execution backend** with SQLite persistence (optional)
+- Dynamic tax calculation, promotions, and shipping rates via iCommerce
+- In-memory storage with TTL (fallback when iCommerce disabled)
 - Basic totals calculation (subtotal, tax, total)
 - Optional API key authentication
 - Optional idempotency handling
@@ -131,6 +133,51 @@ and a processing event.
 - Discount codes are normalized to uppercase. Supported codes:
   `SAVE10`, `SAVE5`, `SHIPFREE`.
 
+## Commerce Backend (iCommerce)
+
+The handler can use **StateSet iCommerce** as its execution backend, providing:
+
+- **SQLite persistence** - Checkouts and orders survive server restarts
+- **Real inventory tracking** - Stock management with reservation support
+- **Dynamic promotions** - Full promotion engine (percentage, fixed, BOGO, etc.)
+- **Multi-jurisdiction tax** - Address-based tax calculation
+- **Dynamic shipping rates** - Real carrier rates when configured
+
+### Enabling iCommerce
+
+iCommerce is **enabled by default**. On startup, the handler initializes a SQLite
+database at `./commerce.db`. To disable and use in-memory storage only:
+
+```bash
+COMMERCE_ENABLED=false cargo run
+```
+
+### Hybrid Architecture
+
+All commerce integrations use a hybrid pattern:
+1. Try iCommerce first for persistence and dynamic calculation
+2. Fall back to in-memory/static behavior if iCommerce is unavailable
+
+This ensures backward compatibility and graceful degradation.
+
+### Feature Flags
+
+You can selectively enable/disable iCommerce features:
+
+```bash
+# Use iCommerce for everything (default when COMMERCE_ENABLED=true)
+COMMERCE_ENABLED=true
+
+# Use iCommerce storage but static tax rates
+USE_ICOMMERCE_TAX=false
+
+# Use iCommerce storage but hardcoded promo codes
+USE_ICOMMERCE_PROMOTIONS=false
+
+# Use iCommerce storage but static shipping options
+USE_ICOMMERCE_SHIPPING=false
+```
+
 ## Tokenization
 
 `/tokenize` and `/detokenize` implement the UCP tokenization handler. Tokens
@@ -217,6 +264,11 @@ The proto definition lives at `proto/ucp_handler/v1/ucp_handler.proto`.
 | `UCP_OAUTH_SERVICE_DOCUMENTATION` | _unset_ | Optional OAuth metadata documentation URL |
 | `UCP_TOKEN_TTL_SECONDS` | `900` | Tokenization token TTL (seconds) |
 | `UCP_TOKEN_SINGLE_USE` | `true` | Remove token after first detokenize |
+| `COMMERCE_ENABLED` | `true` | Enable iCommerce execution backend |
+| `COMMERCE_DB_PATH` | `./commerce.db` | SQLite database path for commerce data |
+| `USE_ICOMMERCE_TAX` | `true` | Use iCommerce for tax calculation |
+| `USE_ICOMMERCE_PROMOTIONS` | `true` | Use iCommerce for promotions/discounts |
+| `USE_ICOMMERCE_SHIPPING` | `true` | Use iCommerce for shipping rates |
 
 ## Node.js Bindings
 
@@ -287,10 +339,11 @@ Bindings live in `bindings/ruby/`. See `bindings/ruby/README.md` for build and u
 
 ## Notes
 
-- This implementation uses an in-memory product catalog with demo items.
-- Totals are computed using a fixed tax rate for illustration.
+- By default, iCommerce provides SQLite persistence for checkouts, orders, and inventory.
+- When iCommerce is disabled, the implementation uses an in-memory product catalog with demo items.
+- Tax calculation uses iCommerce's multi-jurisdiction engine when enabled, or a fixed rate as fallback.
 - The server advertises a sample payment handler (`dev.ucp.payments.card`).
-- Discount codes supported by the demo engine: `SAVE10`, `SAVE5`, `SHIPFREE`.
+- Discount codes supported by the fallback engine: `SAVE10`, `SAVE5`, `SHIPFREE`. iCommerce supports full promotion rules.
 - OAuth identity linking is advertised when enabled; tokens are stored in-memory.
 - Buyer consent data is preserved when `UCP_BUYER_CONSENT_ENABLED=true`.
 - AP2 mandate support uses a configured merchant authorization and only checks presence of `ap2.checkout_mandate`.
