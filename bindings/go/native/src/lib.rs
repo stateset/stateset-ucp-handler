@@ -51,6 +51,7 @@ impl UcpCheckoutService {
         let service = RustCheckoutService::new(
             store,
             catalog,
+            None,
             event_sender,
             config.ucp_version,
             config.service_version,
@@ -60,6 +61,9 @@ impl UcpCheckoutService {
             None,
             config.identity_linking_enabled.unwrap_or(false),
             config.buyer_consent_enabled.unwrap_or(false),
+            false,
+            false,
+            false,
             config.ap2_enabled.unwrap_or(false),
             config.ap2_merchant_authorization,
             None,

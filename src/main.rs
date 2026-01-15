@@ -60,11 +60,12 @@ use oauth::{
     build_redirect_uri, parse_basic_auth, AuthorizationRequest, OAuthConfig, OAuthService,
     RevocationRequest, TokenRequest,
 };
+use order_api::{AdjustmentRequest, FulfillmentEventRequest, OrderService, OrderStore};
 use service::CheckoutService;
 use store::CheckoutStore;
 use tokenization::TokenizationService;
-use ucp_meta::{apply_negotiated_checkout, requires_ap2_mandate};
-use webhook::OrderWebhook;
+use ucp_meta::{apply_negotiated_checkout, apply_negotiated_order, requires_ap2_mandate};
+use webhook::{OrderWebhook, OrderWebhookOptions};
 use tower_http::{
     compression::CompressionLayer, cors::CorsLayer, limit::RequestBodyLimitLayer,
     trace::TraceLayer,
@@ -87,6 +88,7 @@ pub struct AppState {
     response_signing_key: Option<Arc<SigningKey>>,
     business_capabilities: Arc<Vec<Capability>>,
     business_version: String,
+    order_service: Arc<OrderService>,
 }
 
 impl AppState {
@@ -172,7 +174,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .signing_private_key_json
         .as_deref()
         .and_then(|raw| {
-            let jwk: JwkPrivateKey = serde_json::from_str(raw).ok()?;
+            let mut jwk: JwkPrivateKey = serde_json::from_str(raw).ok()?;
+            if let Some(override_kid) = config.ap2_signing_key_id.as_ref() {
+                jwk.kid = override_kid.clone();
+            }
             match load_signing_key_from_private(&jwk) {
                 Ok(key) => {
                     info!("Loaded AP2 signing key: {}", jwk.kid);
@@ -221,6 +226,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         signing_keys,
         config.oauth_enabled,
         config.buyer_consent_enabled,
+        config.use_icommerce_tax,
+        config.use_icommerce_promotions,
+        config.use_icommerce_shipping,
         config.ap2_enabled,
         config.ap2_merchant_authorization.clone(),
         ap2_signing_key,
@@ -248,8 +256,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    let order_store = match &commerce_engine {
+        Some(engine) => OrderStore::new_with_commerce(engine.clone()),
+        None => OrderStore::new(),
+    };
+    let order_service = Arc::new(OrderService::new(
+        order_store.clone(),
+        config.ucp_version.clone(),
+        config.base_url.clone(),
+    ));
+
     // Profile cache for platform profile negotiation (1 hour TTL)
-    let profile_cache = Arc::new(ProfileCache::new(Duration::from_secs(3600)));
+    let profile_cache = Arc::new(ProfileCache::new_with_timeout(
+        Duration::from_secs(config.profile_cache_ttl_seconds),
+        Duration::from_secs(config.profile_fetch_timeout_seconds),
+    ));
 
     // MCP handler for JSON-RPC transport
     let mcp_handler = Arc::new(McpHandler::new(service.clone()));
@@ -277,18 +298,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         response_signing_key,
         business_capabilities,
         business_version,
+        order_service: order_service.clone(),
     };
 
-    let webhook_sender = OrderWebhook::new(
+    let mut webhook_options = OrderWebhookOptions::default();
+    webhook_options.timeout = Duration::from_secs(config.webhook_timeout_seconds);
+    webhook_options.max_retries = config.webhook_max_retries;
+    webhook_options.retry_backoff = Duration::from_millis(config.webhook_retry_base_ms);
+
+    let webhook_sender = OrderWebhook::new_with_options(
         config.order_webhook_url.clone(),
         config.order_webhook_api_key.clone(),
         config.webhook_signature.clone(),
+        webhook_options,
     );
 
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
             match event {
                 Event::OrderCreated { order } => {
+                    order_store.insert(order.clone()).await;
                     let order_event = OrderEvent {
                         order,
                         event_id: format!("evt_{}", uuid::Uuid::new_v4()),
@@ -308,6 +337,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/checkout-sessions/:id", get(get_checkout).put(update_checkout))
         .route("/checkout-sessions/:id/complete", post(complete_checkout))
         .route("/checkout-sessions/:id/cancel", post(cancel_checkout))
+        .route("/orders/:id", get(get_order))
+        .route(
+            "/orders/:id/fulfillment-events",
+            post(add_fulfillment_event),
+        )
+        .route("/orders/:id/adjustments", post(add_adjustment))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             idempotency_middleware,
@@ -333,7 +368,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_headers_middleware,
-        ));
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            request_signature_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(state.clone(), ucp_agent_middleware));
 
     let oauth_enabled = state.oauth.is_some();
     let mut app = Router::new()
@@ -395,6 +435,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(CompressionLayer::new())
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn(response_headers_middleware))
         .with_state(state);
 
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
@@ -564,6 +605,74 @@ async fn cancel_checkout(
     build_json_response(
         StatusCode::OK,
         &checkout,
+        &headers,
+        state.response_signing_key.as_deref(),
+    )
+}
+
+async fn get_order(
+    State(state): State<AppState>,
+    Extension(context): Extension<UcpRequestContext>,
+    headers: HeaderMap,
+    Path(order_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let mut order = state
+        .order_service
+        .get_order(&order_id)
+        .await
+        .map_err(ApiError::from_service)?;
+
+    apply_negotiated_order(&mut order, Some(&context.negotiated));
+
+    build_json_response(
+        StatusCode::OK,
+        &order,
+        &headers,
+        state.response_signing_key.as_deref(),
+    )
+}
+
+async fn add_fulfillment_event(
+    State(state): State<AppState>,
+    Extension(context): Extension<UcpRequestContext>,
+    headers: HeaderMap,
+    Path(order_id): Path<String>,
+    Json(payload): Json<FulfillmentEventRequest>,
+) -> Result<Response, ApiError> {
+    let mut order = state
+        .order_service
+        .add_fulfillment_event(&order_id, payload)
+        .await
+        .map_err(ApiError::from_service)?;
+
+    apply_negotiated_order(&mut order, Some(&context.negotiated));
+
+    build_json_response(
+        StatusCode::OK,
+        &order,
+        &headers,
+        state.response_signing_key.as_deref(),
+    )
+}
+
+async fn add_adjustment(
+    State(state): State<AppState>,
+    Extension(context): Extension<UcpRequestContext>,
+    headers: HeaderMap,
+    Path(order_id): Path<String>,
+    Json(payload): Json<AdjustmentRequest>,
+) -> Result<Response, ApiError> {
+    let mut order = state
+        .order_service
+        .add_adjustment(&order_id, payload)
+        .await
+        .map_err(ApiError::from_service)?;
+
+    apply_negotiated_order(&mut order, Some(&context.negotiated));
+
+    build_json_response(
+        StatusCode::OK,
+        &order,
         &headers,
         state.response_signing_key.as_deref(),
     )
@@ -864,6 +973,32 @@ async fn require_headers_middleware(
     }
 
     next.run(request).await
+}
+
+async fn response_headers_middleware(
+    headers: HeaderMap,
+    request: Request,
+    next: Next,
+) -> Response {
+    let request_id = headers.get("Request-Id").cloned();
+    let idempotency_key = headers.get("Idempotency-Key").cloned();
+
+    let mut response = next.run(request).await;
+    let response_headers = response.headers_mut();
+
+    if let Some(value) = request_id {
+        if response_headers.get("request-id").is_none() {
+            response_headers.insert(HeaderName::from_static("request-id"), value);
+        }
+    }
+
+    if let Some(value) = idempotency_key {
+        if response_headers.get("idempotency-key").is_none() {
+            response_headers.insert(HeaderName::from_static("idempotency-key"), value);
+        }
+    }
+
+    response
 }
 
 async fn a2a_extensions_middleware(

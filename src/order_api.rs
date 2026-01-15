@@ -17,7 +17,7 @@ use crate::errors::ServiceError;
 use crate::models::{Order, UcpResponseMeta, CapabilityRef, OrderLineItem, OrderQuantity, Total, ItemResponse, OrderFulfillment};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -373,19 +373,32 @@ pub struct Adjustment {
 pub struct OrderService {
     store: OrderStore,
     ucp_version: String,
+    base_url: String,
 }
 
 impl OrderService {
-    pub fn new(store: OrderStore, ucp_version: String) -> Self {
-        Self { store, ucp_version }
+    pub fn new(store: OrderStore, ucp_version: String, base_url: String) -> Self {
+        Self {
+            store,
+            ucp_version,
+            base_url,
+        }
+    }
+
+    pub async fn insert_order(&self, order: Order) {
+        let mut order = order;
+        self.apply_ucp_meta(&mut order);
+        self.store.insert(order).await;
     }
 
     /// Gets an order by ID
     pub async fn get_order(&self, order_id: &str) -> Result<Order, ServiceError> {
-        self.store
+        let mut order = self.store
             .get(order_id)
             .await
-            .ok_or_else(|| ServiceError::NotFound(format!("Order {} not found", order_id)))
+            .ok_or_else(|| ServiceError::NotFound(format!("Order {} not found", order_id)))?;
+        self.apply_ucp_meta(&mut order);
+        Ok(order)
     }
 
     /// Adds a fulfillment event to an order
@@ -395,6 +408,7 @@ impl OrderService {
         request: FulfillmentEventRequest,
     ) -> Result<Order, ServiceError> {
         let mut order = self.get_order(order_id).await?;
+        self.validate_fulfillment_request(&order, &request)?;
 
         // Create the fulfillment event
         let event = FulfillmentEvent {
@@ -436,6 +450,7 @@ impl OrderService {
         request: AdjustmentRequest,
     ) -> Result<Order, ServiceError> {
         let mut order = self.get_order(order_id).await?;
+        self.validate_adjustment_request(&order, &request)?;
 
         // Create the adjustment
         let adjustment = Adjustment {
@@ -480,6 +495,115 @@ impl OrderService {
                 }
             }
         }
+    }
+
+    fn apply_ucp_meta(&self, order: &mut Order) {
+        order.ucp.version = self.ucp_version.clone();
+        for cap in order.ucp.capabilities.iter_mut() {
+            cap.version = self.ucp_version.clone();
+        }
+
+        let base_url = self.base_url.trim_end_matches('/');
+        let has_placeholder = order
+            .permalink_url
+            .starts_with("https://example.com/orders/");
+        if !base_url.is_empty()
+            && (order.permalink_url.trim().is_empty() || has_placeholder)
+        {
+            order.permalink_url = format!("{}/orders/{}", base_url, order.id);
+        }
+    }
+
+    fn validate_fulfillment_request(
+        &self,
+        order: &Order,
+        request: &FulfillmentEventRequest,
+    ) -> Result<(), ServiceError> {
+        if request.event_type.trim().is_empty() {
+            return Err(ServiceError::InvalidInput(
+                "fulfillment event type is required".to_string(),
+            ));
+        }
+
+        self.validate_line_item_refs(order, &request.line_items)
+    }
+
+    fn validate_adjustment_request(
+        &self,
+        order: &Order,
+        request: &AdjustmentRequest,
+    ) -> Result<(), ServiceError> {
+        if request.adjustment_type.trim().is_empty() {
+            return Err(ServiceError::InvalidInput(
+                "adjustment type is required".to_string(),
+            ));
+        }
+
+        if request.amount.is_none()
+            && request
+                .line_items
+                .as_ref()
+                .map(|items| items.is_empty())
+                .unwrap_or(true)
+        {
+            return Err(ServiceError::InvalidInput(
+                "adjustment must include line_items or amount".to_string(),
+            ));
+        }
+
+        if let Some(items) = request.line_items.as_ref() {
+            self.validate_line_item_refs(order, items)?;
+        }
+
+        if let Some(amount) = request.amount {
+            if amount < 0 {
+                return Err(ServiceError::InvalidInput(
+                    "adjustment amount must be positive".to_string(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_line_item_refs(
+        &self,
+        order: &Order,
+        items: &[FulfillmentLineItem],
+    ) -> Result<(), ServiceError> {
+        if items.is_empty() {
+            return Err(ServiceError::InvalidInput(
+                "line_items must contain at least one item".to_string(),
+            ));
+        }
+
+        let mut seen = HashSet::new();
+        for item in items {
+            if item.id.trim().is_empty() {
+                return Err(ServiceError::InvalidInput(
+                    "line_items.id is required".to_string(),
+                ));
+            }
+            if item.quantity <= 0 {
+                return Err(ServiceError::InvalidInput(
+                    "line_items.quantity must be greater than 0".to_string(),
+                ));
+            }
+            if !seen.insert(item.id.as_str()) {
+                return Err(ServiceError::InvalidInput(format!(
+                    "duplicate line_item id {}",
+                    item.id
+                )));
+            }
+            if !order.line_items.iter().any(|li| li.id == item.id) {
+                return Err(ServiceError::InvalidInput(format!(
+                    "line_item {} not found on order",
+                    item.id
+                )));
+            }
+        }
+
+        Ok(())
     }
 
     /// Response metadata for order capability
@@ -555,7 +679,11 @@ mod tests {
         let order = create_test_order();
         store.insert(order).await;
 
-        let service = OrderService::new(store, "2026-01-11".to_string());
+        let service = OrderService::new(
+            store,
+            "2026-01-11".to_string(),
+            "https://example.com".to_string(),
+        );
 
         let request = FulfillmentEventRequest {
             event_type: "shipped".to_string(),
@@ -588,7 +716,11 @@ mod tests {
         let order = create_test_order();
         store.insert(order).await;
 
-        let service = OrderService::new(store, "2026-01-11".to_string());
+        let service = OrderService::new(
+            store,
+            "2026-01-11".to_string(),
+            "https://example.com".to_string(),
+        );
 
         let request = AdjustmentRequest {
             adjustment_type: "refund".to_string(),
@@ -606,5 +738,81 @@ mod tests {
         assert!(updated.adjustments.is_some());
         let adjustments = updated.adjustments.unwrap();
         assert_eq!(adjustments.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_rejects_duplicate_line_items() {
+        let store = OrderStore::new();
+        let order = create_test_order();
+        store.insert(order).await;
+
+        let service = OrderService::new(
+            store,
+            "2026-01-11".to_string(),
+            "https://example.com".to_string(),
+        );
+
+        let request = FulfillmentEventRequest {
+            event_type: "shipped".to_string(),
+            line_items: vec![
+                FulfillmentLineItem {
+                    id: "li_1".to_string(),
+                    quantity: 1,
+                },
+                FulfillmentLineItem {
+                    id: "li_1".to_string(),
+                    quantity: 1,
+                },
+            ],
+            tracking: None,
+            description: None,
+        };
+
+        let result = service.add_fulfillment_event("order_123", request).await;
+        assert!(matches!(result, Err(ServiceError::InvalidInput(_))));
+    }
+
+    #[tokio::test]
+    async fn test_adjustment_requires_amount_or_line_items() {
+        let store = OrderStore::new();
+        let order = create_test_order();
+        store.insert(order).await;
+
+        let service = OrderService::new(
+            store,
+            "2026-01-11".to_string(),
+            "https://example.com".to_string(),
+        );
+
+        let request = AdjustmentRequest {
+            adjustment_type: "refund".to_string(),
+            line_items: None,
+            amount: None,
+            description: Some("missing fields".to_string()),
+            status: None,
+        };
+
+        let result = service.add_adjustment("order_123", request).await;
+        assert!(matches!(result, Err(ServiceError::InvalidInput(_))));
+    }
+
+    #[tokio::test]
+    async fn test_permalink_updated_from_placeholder() {
+        let store = OrderStore::new();
+        let mut order = create_test_order();
+        order.permalink_url = "https://example.com/orders/order_123".to_string();
+        store.insert(order).await;
+
+        let service = OrderService::new(
+            store,
+            "2026-01-11".to_string(),
+            "https://merchant.test".to_string(),
+        );
+
+        let fetched = service.get_order("order_123").await.unwrap();
+        assert_eq!(
+            fetched.permalink_url,
+            "https://merchant.test/orders/order_123"
+        );
     }
 }

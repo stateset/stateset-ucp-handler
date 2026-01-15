@@ -9,10 +9,10 @@ use crate::commerce_adapter::{
 };
 use crate::models::{
     CheckoutResponse, CapabilityRef, PaymentHandler,
-    Fulfillment, PaymentResponse,
+    Fulfillment, LineItemResponse, PaymentResponse,
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use stateset_embedded::{AddCartItem, CartAddress, CreateCart};
+use stateset_embedded::{AddCartItem, CartAddress, CreateCart, UpdateCart};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -143,29 +143,50 @@ impl CheckoutStore {
     pub async fn get(&self, checkout_id: &str) -> Option<CheckoutResponse> {
         // Fast path: check cache first
         {
+            let cache = self.cache.read().await;
+            if let Some(cached) = cache.get(checkout_id) {
+                if !cached.is_expired() {
+                    return Some(cached.checkout.clone());
+                }
+            }
+        }
+
+        let mut expired = false;
+        {
             let mut cache = self.cache.write().await;
             if let Some(cached) = cache.get(checkout_id) {
                 if cached.is_expired() {
                     cache.remove(checkout_id);
-                    // Also clean up overlay
-                    let mut overlays = self.overlays.write().await;
-                    overlays.remove(checkout_id);
-                    return None;
+                    expired = true;
+                } else {
+                    return Some(cached.checkout.clone());
                 }
-                return Some(cached.checkout.clone());
             }
+        }
+
+        if expired {
+            let mut overlays = self.overlays.write().await;
+            overlays.remove(checkout_id);
+            return None;
         }
 
         // Slow path: try iCommerce
         if let Some(ref commerce) = self.commerce {
             if let Some(checkout) = self.load_from_icommerce(commerce, checkout_id).await {
+                let cache_deadline = checkout
+                    .expires_at
+                    .as_ref()
+                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                    .map(|value| value.with_timezone(&Utc))
+                    .or_else(|| Some(Utc::now() + ChronoDuration::hours(1)));
+
                 // Re-populate cache
                 let mut cache = self.cache.write().await;
                 cache.insert(
                     checkout_id.to_string(),
                     CachedCheckout {
                         checkout: checkout.clone(),
-                        expires_at: Some(Utc::now() + ChronoDuration::hours(1)),
+                        expires_at: cache_deadline,
                     },
                 );
                 return Some(checkout);
@@ -207,28 +228,18 @@ impl CheckoutStore {
     ) -> Result<(), String> {
         let cart_id = parse_checkout_id(&checkout.id)
             .ok_or_else(|| "Invalid checkout ID format".to_string())?;
+        let metadata = self.build_cart_metadata(checkout, cart_id);
 
         // Check if cart exists
         let existing = commerce.carts().get(cart_id).map_err(|e| e.to_string())?;
 
         if existing.is_none() {
             // Create new cart with items
-            let items: Vec<AddCartItem> = checkout.line_items.iter().map(|li| {
-                AddCartItem {
-                    sku: li.item.id.clone(),
-                    name: li.item.title.clone(),
-                    quantity: li.quantity,
-                    unit_price: cents_to_decimal(li.item.price),
-                    image_url: li.item.image_url.clone(),
-                    product_id: None,
-                    variant_id: None,
-                    description: None,
-                    original_price: None,
-                    weight: None,
-                    requires_shipping: Some(true),
-                    metadata: None,
-                }
-            }).collect();
+            let items: Vec<AddCartItem> = checkout
+                .line_items
+                .iter()
+                .map(|li| self.build_cart_item(li))
+                .collect();
 
             // Calculate expiration in minutes if we have an expires_at timestamp
             let expires_in_minutes = checkout.expires_at.as_ref().and_then(|s| {
@@ -250,10 +261,7 @@ impl CheckoutStore {
                 shipping_address: None, // Will be set separately if available
                 billing_address: None,
                 notes: None,
-                metadata: Some(serde_json::json!({
-                    "ucp_checkout_id": checkout.id,
-                    "ucp_cart_id": cart_id.to_string()
-                })),
+                metadata: Some(metadata),
             };
 
             let created_cart = commerce.carts().create(request).map_err(|e| e.to_string())?;
@@ -267,6 +275,15 @@ impl CheckoutStore {
                     cart_id
                 );
             }
+        } else {
+            let update = UpdateCart {
+                customer_email: checkout.buyer.as_ref().and_then(|b| b.email.clone()),
+                customer_phone: checkout.buyer.as_ref().and_then(|b| b.phone_number.clone()),
+                customer_name: checkout.buyer.as_ref().and_then(|b| b.full_name.clone()),
+                metadata: Some(metadata),
+                ..Default::default()
+            };
+            commerce.carts().update(cart_id, update).map_err(|e| e.to_string())?;
         }
 
         // Try to extract and set shipping address from fulfillment destinations
@@ -329,6 +346,86 @@ impl CheckoutStore {
         }
     }
 
+    fn build_cart_metadata(
+        &self,
+        checkout: &CheckoutResponse,
+        cart_id: uuid::Uuid,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "ucp_checkout_id": &checkout.id,
+            "ucp_cart_id": cart_id.to_string(),
+            "ucp": {
+                "version": &checkout.ucp.version,
+                "capabilities": &checkout.ucp.capabilities,
+                "payment_handlers": &checkout.payment.handlers,
+            }
+        })
+    }
+
+    fn build_cart_item(&self, line_item: &LineItemResponse) -> AddCartItem {
+        AddCartItem {
+            sku: line_item.item.id.clone(),
+            name: line_item.item.title.clone(),
+            quantity: line_item.quantity,
+            unit_price: cents_to_decimal(line_item.item.price),
+            image_url: line_item.item.image_url.clone(),
+            product_id: None,
+            variant_id: None,
+            description: None,
+            original_price: None,
+            weight: None,
+            requires_shipping: Some(true),
+            metadata: Some(serde_json::json!({
+                "ucp_line_item_id": &line_item.id,
+            })),
+        }
+    }
+
+    fn defaults_from_metadata(
+        &self,
+        metadata: Option<&serde_json::Value>,
+    ) -> (String, Vec<CapabilityRef>, Vec<PaymentHandler>) {
+        let ucp_meta = metadata.and_then(|value| value.get("ucp"));
+        let ucp_version = ucp_meta
+            .and_then(|value| value.get("version"))
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "1.0".to_string());
+
+        let capabilities = ucp_meta
+            .and_then(|value| value.get("capabilities"))
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_else(|| Self::default_capabilities(&ucp_version));
+
+        let payment_handlers = ucp_meta
+            .and_then(|value| value.get("payment_handlers"))
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_else(|| Self::default_payment_handlers(&ucp_version));
+
+        (ucp_version, capabilities, payment_handlers)
+    }
+
+    fn default_capabilities(ucp_version: &str) -> Vec<CapabilityRef> {
+        vec![CapabilityRef {
+            name: "dev.ucp.shopping.checkout".to_string(),
+            version: ucp_version.to_string(),
+        }]
+    }
+
+    fn default_payment_handlers(ucp_version: &str) -> Vec<PaymentHandler> {
+        vec![PaymentHandler {
+            id: "ucp_card".to_string(),
+            name: "dev.ucp.payments.card".to_string(),
+            version: ucp_version.to_string(),
+            spec: "https://ucp.dev/specification/payment-handler-template".to_string(),
+            config_schema: "https://ucp.dev/specification/payment-handler-template".to_string(),
+            instrument_schemas: vec![
+                "https://ucp.dev/schemas/shopping/types/card_payment_instrument.json".to_string(),
+            ],
+            config: serde_json::json!({ "environment": "sandbox" }),
+        }]
+    }
+
     /// Load checkout from iCommerce Cart
     async fn load_from_icommerce(
         &self,
@@ -360,26 +457,7 @@ impl CheckoutStore {
             )
         } else {
             // Defaults when no overlay (e.g., after restart)
-            (
-                "1.0".to_string(),
-                vec![
-                    CapabilityRef {
-                        name: "dev.ucp.shopping.checkout".to_string(),
-                        version: "1.0".to_string(),
-                    },
-                ],
-                vec![PaymentHandler {
-                    id: "ucp_card".to_string(),
-                    name: "dev.ucp.payments.card".to_string(),
-                    version: "1.0".to_string(),
-                    spec: "https://ucp.dev/specification/payment-handler-template".to_string(),
-                    config_schema: "https://ucp.dev/specification/payment-handler-template".to_string(),
-                    instrument_schemas: vec![
-                        "https://ucp.dev/schemas/shopping/types/card_payment_instrument.json".to_string(),
-                    ],
-                    config: serde_json::json!({ "environment": "sandbox" }),
-                }],
-            )
+            self.defaults_from_metadata(cart.metadata.as_ref())
         };
 
         // Convert cart to checkout response

@@ -156,6 +156,14 @@ pub fn cart_to_checkout_response(
 
 /// Convert iCommerce CartItem to UCP LineItemResponse
 pub fn cart_item_to_line_item_response(item: &CartItem) -> LineItemResponse {
+    let line_item_id = item
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("ucp_line_item_id"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| format_line_item_id(item.id));
+
     // Build totals for this line item
     let totals = vec![
         Total {
@@ -166,7 +174,7 @@ pub fn cart_item_to_line_item_response(item: &CartItem) -> LineItemResponse {
     ];
 
     LineItemResponse {
-        id: format_line_item_id(item.id),
+        id: line_item_id,
         item: ItemResponse {
             id: item.sku.clone(),
             title: item.name.clone(),
@@ -390,6 +398,7 @@ pub fn tax_result_to_cents(result: &TaxCalculationResult) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
 
     #[test]
     fn test_cents_decimal_conversion() {
@@ -424,5 +433,36 @@ mod tests {
             cart_status_to_checkout_status(CartStatus::Completed),
             CheckoutStatus::Completed
         ));
+    }
+
+    #[test]
+    fn test_cart_item_metadata_preserves_ucp_id() {
+        let now = Utc::now();
+        let item = CartItem {
+            id: Uuid::new_v4(),
+            cart_id: Uuid::new_v4(),
+            product_id: None,
+            variant_id: None,
+            sku: "sku-1".to_string(),
+            name: "Sample Item".to_string(),
+            description: None,
+            image_url: None,
+            quantity: 2,
+            unit_price: Decimal::new(1000, 2),
+            original_price: None,
+            discount_amount: Decimal::ZERO,
+            tax_amount: Decimal::ZERO,
+            total: Decimal::new(2000, 2),
+            weight: None,
+            requires_shipping: true,
+            metadata: Some(serde_json::json!({
+                "ucp_line_item_id": "li_custom_123",
+            })),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let response = cart_item_to_line_item_response(&item);
+        assert_eq!(response.id, "li_custom_123");
     }
 }

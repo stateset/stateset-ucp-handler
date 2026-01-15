@@ -41,6 +41,17 @@ impl IdempotencyStore {
     }
 
     pub async fn get(&self, key: &str) -> Option<IdempotencyRecord> {
+        {
+            let entries = self.entries.read().await;
+            if let Some(record) = entries.get(key) {
+                if record.created_at.elapsed() <= self.ttl {
+                    return Some(record.clone());
+                }
+            } else {
+                return None;
+            }
+        }
+
         let mut entries = self.entries.write().await;
         if let Some(record) = entries.get(key) {
             if record.created_at.elapsed() > self.ttl {
@@ -49,11 +60,13 @@ impl IdempotencyStore {
             }
             return Some(record.clone());
         }
+
         None
     }
 
     pub async fn insert(&self, key: String, record: IdempotencyRecord) {
         let mut entries = self.entries.write().await;
+        entries.retain(|_, entry| entry.created_at.elapsed() <= self.ttl);
         entries.insert(key, record);
     }
 
@@ -232,4 +245,51 @@ pub async fn idempotency_middleware(
     }
 
     Response::from_parts(response_parts, Body::from(response_bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{Method, Uri};
+
+    #[tokio::test]
+    async fn idempotency_store_returns_record_when_valid() {
+        let store = IdempotencyStore::new(Duration::from_secs(60));
+        let record = IdempotencyRecord {
+            request_hash: "hash-1".to_string(),
+            status_code: 201,
+            body: b"ok".to_vec(),
+            content_type: Some("application/json".to_string()),
+            created_at: Instant::now(),
+        };
+
+        store.insert("key-1".to_string(), record.clone()).await;
+        let fetched = store.get("key-1").await.expect("record");
+        assert_eq!(fetched.status_code, record.status_code);
+        assert_eq!(fetched.request_hash, record.request_hash);
+    }
+
+    #[tokio::test]
+    async fn idempotency_store_expires_records() {
+        let store = IdempotencyStore::new(Duration::from_secs(1));
+        let record = IdempotencyRecord {
+            request_hash: "hash-2".to_string(),
+            status_code: 200,
+            body: b"expired".to_vec(),
+            content_type: None,
+            created_at: Instant::now() - Duration::from_secs(5),
+        };
+
+        store.insert("key-2".to_string(), record).await;
+        assert!(store.get("key-2").await.is_none());
+    }
+
+    #[test]
+    fn compute_request_hash_changes_with_body() {
+        let method = Method::POST;
+        let uri: Uri = "/api/checkouts".parse().unwrap();
+        let hash_a = IdempotencyStore::compute_request_hash(&method, &uri, b"payload-a");
+        let hash_b = IdempotencyStore::compute_request_hash(&method, &uri, b"payload-b");
+        assert_ne!(hash_a, hash_b);
+    }
 }

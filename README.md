@@ -128,6 +128,9 @@ platform requires signature verification, provide a detached JWT in
 The event includes a full order payload with initial fulfillment expectations
 and a processing event.
 
+Orders are also stored locally and can be retrieved or updated via the
+`/api/orders` endpoints after checkout completion.
+
 ## Fulfillment and Discounts
 
 - If `fulfillment` is supplied without groups/options, the handler injects
@@ -203,6 +206,9 @@ Enable AP2 by setting `UCP_AP2_ENABLED=true` and providing
 responses include `ap2.merchant_authorization`, and complete checkout requests
 must include `ap2.checkout_mandate`.
 
+If you load the signing key from `UCP_SIGNING_PRIVATE_KEY_JSON`, you can override
+the JWK `kid` advertised in signatures with `UCP_AP2_SIGNING_KEY_ID`.
+
 ## Endpoints
 
 | Method | Endpoint | Description |
@@ -213,6 +219,9 @@ must include `ap2.checkout_mandate`.
 | PUT | `/api/checkout-sessions/:id` | Update checkout |
 | POST | `/api/checkout-sessions/:id/complete` | Complete checkout |
 | POST | `/api/checkout-sessions/:id/cancel` | Cancel checkout |
+| GET | `/api/orders/:id` | Retrieve order |
+| POST | `/api/orders/:id/fulfillment-events` | Add fulfillment event |
+| POST | `/api/orders/:id/adjustments` | Add order adjustment |
 | POST | `/tokenize` | Tokenize credential |
 | POST | `/detokenize` | Detokenize credential |
 | GET | `/.well-known/oauth-authorization-server` | OAuth metadata (when enabled) |
@@ -248,14 +257,20 @@ The proto definition lives at `proto/ucp_handler/v1/ucp_handler.proto`.
 | `UCP_REQUIRE_REQUEST_ID` | `false` | Require Request-Id header |
 | `UCP_REQUIRE_UCP_AGENT` | `true` | Require UCP-Agent header |
 | `UCP_REQUIRE_REQUEST_SIGNATURE` | `true` | Require Request-Signature on POST/PUT |
+| `UCP_PROFILE_CACHE_TTL_SECONDS` | `3600` | Cache TTL for platform profiles (seconds) |
+| `UCP_PROFILE_FETCH_TIMEOUT_SECONDS` | `10` | Timeout for fetching platform profiles (seconds) |
 | `UCP_ORDER_WEBHOOK_URL` | _unset_ | Platform webhook URL for order events |
 | `UCP_ORDER_WEBHOOK_API_KEY` | _unset_ | API key sent to the platform webhook |
 | `UCP_WEBHOOK_SIGNATURE` | _unset_ | Static `Request-Signature` header value for webhooks |
+| `UCP_WEBHOOK_TIMEOUT_SECONDS` | `10` | Timeout for webhook delivery attempts (seconds) |
+| `UCP_WEBHOOK_MAX_RETRIES` | `2` | Max retry attempts for webhook delivery |
+| `UCP_WEBHOOK_RETRY_BASE_MS` | `250` | Base backoff delay for webhook retries (milliseconds) |
 | `UCP_SIGNING_KEYS_JSON` | _unset_ | JSON array of JWKs advertised in discovery |
 | `UCP_SIGNING_PRIVATE_KEY_JSON` | _unset_ | JWK private key for AP2 + response signing |
 | `UCP_BUYER_CONSENT_ENABLED` | `false` | Advertise buyer consent extension support |
 | `UCP_AP2_ENABLED` | `false` | Enable AP2 mandate extension |
 | `UCP_AP2_MERCHANT_AUTH` | _unset_ | Detached JWS signature for AP2 merchant authorization |
+| `UCP_AP2_SIGNING_KEY_ID` | _unset_ | Override `kid` for AP2 signing key |
 | `UCP_OAUTH_ENABLED` | `false` | Enable OAuth identity linking endpoints |
 | `UCP_OAUTH_ISSUER` | `http://127.0.0.1:8081` | Issuer URL for OAuth metadata |
 | `UCP_OAUTH_CLIENT_ID` | `ucp-demo-client` | OAuth client identifier |
@@ -264,7 +279,6 @@ The proto definition lives at `proto/ucp_handler/v1/ucp_handler.proto`.
 | `UCP_OAUTH_SCOPES` | `ucp:scopes:checkout_session` | Space- or comma-separated OAuth scopes |
 | `UCP_OAUTH_TOKEN_TTL_SECONDS` | `3600` | OAuth access token TTL (seconds) |
 | `UCP_OAUTH_CODE_TTL_SECONDS` | `300` | OAuth authorization code TTL (seconds) |
-| `UCP_OAUTH_REDIRECT_URIS` | _unset_ | Comma-separated allowlist for OAuth redirects |
 | `UCP_OAUTH_SERVICE_DOCUMENTATION` | _unset_ | Optional OAuth metadata documentation URL |
 | `UCP_TOKEN_TTL_SECONDS` | `900` | Tokenization token TTL (seconds) |
 | `UCP_TOKEN_SINGLE_USE` | `true` | Remove token after first detokenize |

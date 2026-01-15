@@ -112,9 +112,14 @@ pub struct ProfileCache {
 
 impl ProfileCache {
     pub fn new(default_ttl: Duration) -> Self {
+        Self::new_with_timeout(default_ttl, Duration::from_secs(10))
+    }
+
+    pub fn new_with_timeout(default_ttl: Duration, timeout: Duration) -> Self {
+        let user_agent = format!("stateset-ucp-handler/{}", env!("CARGO_PKG_VERSION"));
         let http_client = Client::builder()
-            .timeout(Duration::from_secs(10))
-            .user_agent("stateset-ucp-handler/0.1.0")
+            .timeout(timeout)
+            .user_agent(user_agent)
             .build()
             .expect("Failed to create HTTP client");
 
@@ -127,14 +132,16 @@ impl ProfileCache {
 
     /// Fetches a platform profile, using cache if available
     pub async fn fetch_profile(&self, profile_url: &str) -> Result<PlatformProfile, NegotiationError> {
-        // Check cache first
-        {
+        let cached = {
             let cache = self.cache.read().await;
-            if let Some(cached) = cache.get(profile_url) {
-                if !cached.is_expired() {
-                    debug!("Using cached profile for {}", profile_url);
-                    return Ok(cached.profile.clone());
-                }
+            cache.get(profile_url).cloned()
+        };
+        let cached_profile = cached.as_ref().map(|entry| entry.profile.clone());
+
+        if let Some(cached) = cached.as_ref() {
+            if !cached.is_expired() {
+                debug!("Using cached profile for {}", profile_url);
+                return Ok(cached.profile.clone());
             }
         }
 
@@ -145,10 +152,31 @@ impl ProfileCache {
             .get(profile_url)
             .header("Accept", "application/json")
             .send()
-            .await
-            .map_err(|e| NegotiationError::HttpError(e.to_string()))?;
+            .await;
+
+        let response = match response {
+            Ok(response) => response,
+            Err(err) => {
+                if let Some(profile) = cached_profile.clone() {
+                    warn!(
+                        "Profile fetch failed for {}, using stale cache: {}",
+                        profile_url, err
+                    );
+                    return Ok(profile);
+                }
+                return Err(NegotiationError::HttpError(err.to_string()));
+            }
+        };
 
         if !response.status().is_success() {
+            if let Some(profile) = cached_profile.clone() {
+                warn!(
+                    "Profile fetch for {} returned {}, using stale cache",
+                    profile_url,
+                    response.status()
+                );
+                return Ok(profile);
+            }
             return Err(NegotiationError::ProfileFetchError(format!(
                 "HTTP {} from {}",
                 response.status(),
@@ -160,10 +188,19 @@ impl ProfileCache {
         let ttl = parse_cache_control(response.headers().get("cache-control"))
             .unwrap_or(self.default_ttl);
 
-        let discovery: DiscoveryDocument = response
-            .json()
-            .await
-            .map_err(|e| NegotiationError::InvalidProfile(e.to_string()))?;
+        let discovery: DiscoveryDocument = match response.json().await {
+            Ok(discovery) => discovery,
+            Err(err) => {
+                if let Some(profile) = cached_profile.clone() {
+                    warn!(
+                        "Invalid profile from {}, using stale cache: {}",
+                        profile_url, err
+                    );
+                    return Ok(profile);
+                }
+                return Err(NegotiationError::InvalidProfile(err.to_string()));
+            }
+        };
 
         let profile = PlatformProfile {
             version: discovery.ucp.version.clone(),

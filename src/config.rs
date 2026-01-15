@@ -18,6 +18,9 @@ pub struct Config {
     pub order_webhook_url: Option<String>,
     pub order_webhook_api_key: Option<String>,
     pub webhook_signature: Option<String>,
+    pub webhook_timeout_seconds: u64,
+    pub webhook_max_retries: usize,
+    pub webhook_retry_base_ms: u64,
     pub signing_keys_json: Option<String>,
     pub require_request_id: bool,
     pub buyer_consent_enabled: bool,
@@ -38,6 +41,8 @@ pub struct Config {
     pub token_single_use: bool,
     pub require_ucp_agent: bool,
     pub require_request_signature: bool,
+    pub profile_cache_ttl_seconds: u64,
+    pub profile_fetch_timeout_seconds: u64,
 
     // iCommerce engine configuration
     /// Enable iCommerce as the execution backend (default: true)
@@ -81,27 +86,27 @@ impl Config {
 
         let require_auth = std::env::var("UCP_REQUIRE_AUTH")
             .ok()
-            .map(|value| value == "true" || value == "1")
+            .map(|value| parse_env_bool(&value))
             .unwrap_or(!api_keys.is_empty());
 
         let require_idempotency = std::env::var("UCP_REQUIRE_IDEMPOTENCY")
             .ok()
-            .map(|value| value == "true" || value == "1")
+            .map(|value| parse_env_bool(&value))
             .unwrap_or(false);
 
         let require_request_id = std::env::var("UCP_REQUIRE_REQUEST_ID")
             .ok()
-            .map(|value| value == "true" || value == "1")
+            .map(|value| parse_env_bool(&value))
             .unwrap_or(false);
 
         let buyer_consent_enabled = std::env::var("UCP_BUYER_CONSENT_ENABLED")
             .ok()
-            .map(|value| value == "true" || value == "1")
+            .map(|value| parse_env_bool(&value))
             .unwrap_or(false);
 
         let ap2_enabled = std::env::var("UCP_AP2_ENABLED")
             .ok()
-            .map(|value| value == "true" || value == "1")
+            .map(|value| parse_env_bool(&value))
             .unwrap_or(false);
 
         let ap2_merchant_authorization = std::env::var("UCP_AP2_MERCHANT_AUTH")
@@ -135,7 +140,7 @@ impl Config {
 
         let oauth_enabled = std::env::var("UCP_OAUTH_ENABLED")
             .ok()
-            .map(|value| value == "true" || value == "1")
+            .map(|value| parse_env_bool(&value))
             .unwrap_or(false);
 
         let oauth_issuer = std::env::var("UCP_OAUTH_ISSUER").unwrap_or_else(|_| base_url.clone());
@@ -183,23 +188,48 @@ impl Config {
 
         let token_single_use = std::env::var("UCP_TOKEN_SINGLE_USE")
             .ok()
-            .map(|value| value == "true" || value == "1")
+            .map(|value| parse_env_bool(&value))
             .unwrap_or(true);
 
         let require_ucp_agent = std::env::var("UCP_REQUIRE_UCP_AGENT")
             .ok()
-            .map(|value| value == "true" || value == "1")
+            .map(|value| parse_env_bool(&value))
             .unwrap_or(true);
 
         let require_request_signature = std::env::var("UCP_REQUIRE_REQUEST_SIGNATURE")
             .ok()
-            .map(|value| value == "true" || value == "1")
+            .map(|value| parse_env_bool(&value))
             .unwrap_or(true);
+
+        let profile_cache_ttl_seconds: u64 = std::env::var("UCP_PROFILE_CACHE_TTL_SECONDS")
+            .unwrap_or_else(|_| "3600".to_string())
+            .parse::<u64>()?
+            .max(30);
+
+        let profile_fetch_timeout_seconds: u64 =
+            std::env::var("UCP_PROFILE_FETCH_TIMEOUT_SECONDS")
+                .unwrap_or_else(|_| "10".to_string())
+                .parse::<u64>()?
+                .max(1);
+
+        let webhook_timeout_seconds: u64 = std::env::var("UCP_WEBHOOK_TIMEOUT_SECONDS")
+            .unwrap_or_else(|_| "10".to_string())
+            .parse::<u64>()?
+            .max(1);
+
+        let webhook_max_retries: usize = std::env::var("UCP_WEBHOOK_MAX_RETRIES")
+            .unwrap_or_else(|_| "2".to_string())
+            .parse::<usize>()?;
+
+        let webhook_retry_base_ms: u64 = std::env::var("UCP_WEBHOOK_RETRY_BASE_MS")
+            .unwrap_or_else(|_| "250".to_string())
+            .parse::<u64>()?
+            .max(1);
 
         // iCommerce configuration
         let commerce_enabled = std::env::var("COMMERCE_ENABLED")
             .ok()
-            .map(|value| value == "true" || value == "1")
+            .map(|value| parse_env_bool(&value))
             .unwrap_or(true); // Enabled by default
 
         let commerce_db_path = std::env::var("COMMERCE_DB_PATH")
@@ -207,17 +237,17 @@ impl Config {
 
         let use_icommerce_tax = std::env::var("USE_ICOMMERCE_TAX")
             .ok()
-            .map(|value| value == "true" || value == "1")
+            .map(|value| parse_env_bool(&value))
             .unwrap_or(commerce_enabled);
 
         let use_icommerce_promotions = std::env::var("USE_ICOMMERCE_PROMOTIONS")
             .ok()
-            .map(|value| value == "1" || value == "true")
+            .map(|value| parse_env_bool(&value))
             .unwrap_or(commerce_enabled);
 
         let use_icommerce_shipping = std::env::var("USE_ICOMMERCE_SHIPPING")
             .ok()
-            .map(|value| value == "true" || value == "1")
+            .map(|value| parse_env_bool(&value))
             .unwrap_or(commerce_enabled);
 
         Ok(Self {
@@ -237,6 +267,9 @@ impl Config {
             order_webhook_url: std::env::var("UCP_ORDER_WEBHOOK_URL").ok(),
             order_webhook_api_key: std::env::var("UCP_ORDER_WEBHOOK_API_KEY").ok(),
             webhook_signature: std::env::var("UCP_WEBHOOK_SIGNATURE").ok(),
+            webhook_timeout_seconds,
+            webhook_max_retries,
+            webhook_retry_base_ms,
             signing_keys_json: std::env::var("UCP_SIGNING_KEYS_JSON").ok(),
             require_request_id,
             buyer_consent_enabled,
@@ -257,6 +290,8 @@ impl Config {
             token_single_use,
             require_ucp_agent,
             require_request_signature,
+            profile_cache_ttl_seconds,
+            profile_fetch_timeout_seconds,
             commerce_enabled,
             commerce_db_path,
             use_icommerce_tax,
@@ -264,6 +299,11 @@ impl Config {
             use_icommerce_shipping,
         })
     }
+}
+
+fn parse_env_bool(value: &str) -> bool {
+    let value = value.trim();
+    value == "1" || value.eq_ignore_ascii_case("true")
 }
 
 #[cfg(test)]
@@ -332,6 +372,11 @@ mod tests {
             "UCP_TOKEN_SINGLE_USE",
             "UCP_REQUIRE_UCP_AGENT",
             "UCP_REQUIRE_REQUEST_SIGNATURE",
+            "UCP_PROFILE_CACHE_TTL_SECONDS",
+            "UCP_PROFILE_FETCH_TIMEOUT_SECONDS",
+            "UCP_WEBHOOK_TIMEOUT_SECONDS",
+            "UCP_WEBHOOK_MAX_RETRIES",
+            "UCP_WEBHOOK_RETRY_BASE_MS",
             "COMMERCE_ENABLED",
             "COMMERCE_DB_PATH",
             "USE_ICOMMERCE_TAX",
@@ -347,6 +392,11 @@ mod tests {
         assert_eq!(config.ucp_version, "2026-01-11");
         assert!(config.api_keys.is_empty());
         assert!(!config.require_auth);
+        assert_eq!(config.profile_cache_ttl_seconds, 3600);
+        assert_eq!(config.profile_fetch_timeout_seconds, 10);
+        assert_eq!(config.webhook_timeout_seconds, 10);
+        assert_eq!(config.webhook_max_retries, 2);
+        assert_eq!(config.webhook_retry_base_ms, 250);
     }
 
     #[test]

@@ -53,6 +53,7 @@ impl A2AHandler {
         let checkout_service = CheckoutService::new(
             store,
             catalog,
+            None,
             event_sender,
             config.ucp_version.clone(),
             config.service_version,
@@ -60,6 +61,9 @@ impl A2AHandler {
             config.session_ttl_seconds as u64,
             config.tax_bps,
             None,
+            false,
+            false,
+            false,
             false,
             false,
             false,

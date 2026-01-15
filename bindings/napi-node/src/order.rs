@@ -14,6 +14,8 @@ use tokio::sync::RwLock;
 pub struct OrderServiceConfig {
     /// UCP protocol version
     pub ucp_version: String,
+    /// Base URL used to construct order permalinks
+    pub base_url: Option<String>,
 }
 
 /// Order service for post-checkout order lifecycle management
@@ -22,7 +24,6 @@ pub struct OrderServiceConfig {
 #[napi]
 pub struct OrderService {
     inner: Arc<RwLock<RustOrderService>>,
-    store: OrderStore,
 }
 
 #[napi]
@@ -31,11 +32,13 @@ impl OrderService {
     #[napi(constructor)]
     pub fn new(config: OrderServiceConfig) -> Self {
         let store = OrderStore::new();
-        let service = RustOrderService::new(store.clone(), config.ucp_version);
+        let base_url = config
+            .base_url
+            .unwrap_or_else(|| "http://127.0.0.1:8081".to_string());
+        let service = RustOrderService::new(store.clone(), config.ucp_version, base_url);
 
         Self {
             inner: Arc::new(RwLock::new(service)),
-            store,
         }
     }
 
@@ -103,7 +106,8 @@ impl OrderService {
         let order: stateset_ucp_lib::models::Order =
             serde_json::from_str(&order_json).map_err(json_error)?;
 
-        self.store.insert(order).await;
+        let service = self.inner.read().await;
+        service.insert_order(order).await;
         Ok(())
     }
 }

@@ -42,6 +42,8 @@ export interface DetachedJws {
 export interface OrderServiceConfig {
   /** UCP protocol version */
   ucpVersion: string
+  /** Base URL used to construct order permalinks */
+  baseUrl?: string
 }
 /** Node.js wrapper for the UCP CheckoutService */
 export declare class CheckoutService {

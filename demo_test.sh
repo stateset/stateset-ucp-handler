@@ -104,3 +104,12 @@ PY
 )
 
 echo "Order ID: ${order_id}"
+
+echo "Fetching order..."
+order_resp=$(curl -sS -X GET "${BASE_URL}/api/orders/${order_id}" "${header_args[@]}")
+order_check=$(python - <<PY
+import json
+print(json.loads('''$order_resp''')["id"])
+PY
+)
+echo "Order fetched: ${order_check}"

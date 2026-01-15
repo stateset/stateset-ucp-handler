@@ -86,6 +86,9 @@ pub struct CheckoutService {
     signing_keys: Option<Vec<crate::models::JwkKey>>,
     identity_linking_enabled: bool,
     buyer_consent_enabled: bool,
+    use_icommerce_tax: bool,
+    use_icommerce_promotions: bool,
+    use_icommerce_shipping: bool,
     ap2_enabled: bool,
     ap2_merchant_authorization: Option<String>,
     ap2_signing_key: Option<SigningKey>,
@@ -108,6 +111,9 @@ impl CheckoutService {
         signing_keys: Option<Vec<crate::models::JwkKey>>,
         identity_linking_enabled: bool,
         buyer_consent_enabled: bool,
+        use_icommerce_tax: bool,
+        use_icommerce_promotions: bool,
+        use_icommerce_shipping: bool,
         ap2_enabled: bool,
         ap2_merchant_authorization: Option<String>,
         ap2_signing_key: Option<SigningKey>,
@@ -153,6 +159,9 @@ impl CheckoutService {
             signing_keys,
             identity_linking_enabled,
             buyer_consent_enabled,
+            use_icommerce_tax,
+            use_icommerce_promotions,
+            use_icommerce_shipping,
             ap2_enabled,
             ap2_merchant_authorization,
             ap2_signing_key,
@@ -176,13 +185,19 @@ impl CheckoutService {
         let mut line_items = self.build_line_items(&request.line_items, &currency)?;
         let (fulfillment, fulfillment_cost) =
             self.build_fulfillment(request.fulfillment, &line_items, None)?;
-        let discount_outcome =
-            self.apply_discounts(&mut line_items, request.discounts, fulfillment_cost)?;
+        let discount_outcome = self.apply_discounts(
+            &mut line_items,
+            request.discounts,
+            fulfillment_cost,
+            &currency,
+        )?;
         let totals = self.calculate_totals(
             &line_items,
             discount_outcome.items_discount,
             fulfillment_cost,
             discount_outcome.order_discount,
+            &currency,
+            fulfillment.as_ref(),
         )?;
 
         let buyer_has_consent = request
@@ -263,13 +278,15 @@ impl CheckoutService {
 
         let discount_input = request.discounts.or(existing_discounts);
         let discount_outcome =
-            self.apply_discounts(&mut line_items, discount_input, fulfillment_cost)?;
+            self.apply_discounts(&mut line_items, discount_input, fulfillment_cost, &currency)?;
 
         let totals = self.calculate_totals(
             &line_items,
             discount_outcome.items_discount,
             fulfillment_cost,
             discount_outcome.order_discount,
+            &currency,
+            fulfillment.as_ref(),
         )?;
 
         let buyer = request.buyer.or(existing.buyer);
@@ -729,6 +746,7 @@ impl CheckoutService {
         line_items: &mut [LineItemResponse],
         discounts: Option<DiscountsObject>,
         fulfillment_cost: i64,
+        currency: &str,
     ) -> Result<DiscountOutcome, ServiceError> {
         let Some(discounts) = discounts else {
             return Ok(DiscountOutcome {
@@ -747,16 +765,19 @@ impl CheckoutService {
             .collect::<Vec<_>>();
 
         // Try iCommerce Promotions first if available
-        if let Some(ref commerce) = self.commerce {
-            if let Some(result) = self.try_icommerce_promotions(
-                commerce,
-                line_items,
-                &normalized_codes,
-                fulfillment_cost,
-            )? {
-                return Ok(result);
+        if self.use_icommerce_promotions {
+            if let Some(ref commerce) = self.commerce {
+                if let Some(result) = self.try_icommerce_promotions(
+                    commerce,
+                    line_items,
+                    &normalized_codes,
+                    fulfillment_cost,
+                    currency,
+                )? {
+                    return Ok(result);
+                }
+                // Fall through to legacy codes if iCommerce didn't match
             }
-            // Fall through to legacy codes if iCommerce didn't match
         }
 
         // Legacy hardcoded discount codes
@@ -770,6 +791,7 @@ impl CheckoutService {
         line_items: &mut [LineItemResponse],
         codes: &[String],
         fulfillment_cost: i64,
+        currency: &str,
     ) -> Result<Option<DiscountOutcome>, ServiceError> {
         use crate::commerce_adapter::{cents_to_decimal, decimal_to_cents};
         use stateset_embedded::{ApplyPromotionsRequest, PromotionLineItem, PromotionTarget};
@@ -807,7 +829,7 @@ impl CheckoutService {
             shipping_amount: cents_to_decimal(fulfillment_cost),
             shipping_country: None,
             shipping_state: None,
-            currency: "USD".to_string(),
+            currency: currency.to_string(),
             is_first_order: false,
         };
 
@@ -1058,6 +1080,8 @@ impl CheckoutService {
         items_discount: i64,
         fulfillment_cost: i64,
         order_discount: i64,
+        currency: &str,
+        fulfillment: Option<&Fulfillment>,
     ) -> Result<Vec<Total>, ServiceError> {
         let subtotal: i64 = line_items
             .iter()
@@ -1099,7 +1123,13 @@ impl CheckoutService {
             (subtotal - items_discount + fulfillment_cost - order_discount).max(0);
 
         // Try iCommerce Tax API first, fall back to fixed rate
-        let tax = self.calculate_tax(line_items, taxable_amount);
+        let tax = self.calculate_tax(
+            line_items,
+            taxable_amount,
+            currency,
+            fulfillment,
+            fulfillment_cost,
+        );
         if tax > 0 {
             totals.push(Total {
                 total_type: "tax".to_string(),
@@ -1119,11 +1149,29 @@ impl CheckoutService {
     }
 
     /// Calculate tax using iCommerce Tax API or fallback to fixed rate
-    fn calculate_tax(&self, line_items: &[LineItemResponse], taxable_amount: i64) -> i64 {
+    fn calculate_tax(
+        &self,
+        line_items: &[LineItemResponse],
+        taxable_amount: i64,
+        currency: &str,
+        fulfillment: Option<&Fulfillment>,
+        fulfillment_cost: i64,
+    ) -> i64 {
+        let tax_address = fulfillment.and_then(|value| self.tax_address_from_fulfillment(value));
+
         // Try iCommerce Tax API if available
-        if let Some(ref commerce) = self.commerce {
-            if let Some(tax) = self.try_icommerce_tax(commerce, line_items) {
-                return tax;
+        if self.use_icommerce_tax {
+            if let Some(ref commerce) = self.commerce {
+                if let Some(tax) = self.try_icommerce_tax(
+                    commerce,
+                    line_items,
+                    currency,
+                    tax_address,
+                    fulfillment_cost,
+                )
+                {
+                    return tax;
+                }
             }
         }
 
@@ -1136,6 +1184,9 @@ impl CheckoutService {
         &self,
         commerce: &crate::commerce::CommerceEngine,
         line_items: &[LineItemResponse],
+        currency: &str,
+        tax_address: Option<stateset_embedded::TaxAddress>,
+        fulfillment_cost: i64,
     ) -> Option<i64> {
         use crate::commerce_adapter::{cents_to_decimal, decimal_to_cents};
         use rust_decimal::Decimal;
@@ -1157,23 +1208,30 @@ impl CheckoutService {
             })
             .collect();
 
-        // For now, use a default address. In production, this would come from fulfillment.
-        // The address-based tax will be more accurate when shipping address is available.
+        let shipping_address = tax_address.unwrap_or_else(|| TaxAddress {
+            country: "US".to_string(),
+            state: None,
+            city: None,
+            postal_code: None,
+            line1: None,
+            line2: None,
+        });
+
+        let shipping_amount = if fulfillment_cost > 0 {
+            Some(cents_to_decimal(fulfillment_cost))
+        } else {
+            None
+        };
+
+        // Use the fulfillment address when available; otherwise fall back to defaults.
         let request = TaxCalculationRequest {
             line_items: tax_line_items,
-            shipping_address: TaxAddress {
-                country: "US".to_string(),
-                state: None,
-                city: None,
-                postal_code: None,
-                line1: None,
-                line2: None,
-            },
+            shipping_address,
             billing_address: None,
-            shipping_amount: None,
+            shipping_amount,
             customer_id: None,
             transaction_date: None,
-            currency: "USD".to_string(),
+            currency: currency.to_string(),
             prices_include_tax: false,
         };
 
@@ -1328,11 +1386,13 @@ impl CheckoutService {
 
     fn get_fulfillment_options(&self, checkout_id: Option<&str>) -> Vec<FulfillmentOption> {
         // Try iCommerce shipping rates first
-        if let Some(ref commerce) = self.commerce {
-            if let Some(id) = checkout_id {
-                if let Some(options) = self.try_icommerce_shipping_rates(commerce, id) {
-                    if !options.is_empty() {
-                        return options;
+        if self.use_icommerce_shipping {
+            if let Some(ref commerce) = self.commerce {
+                if let Some(id) = checkout_id {
+                    if let Some(options) = self.try_icommerce_shipping_rates(commerce, id) {
+                        if !options.is_empty() {
+                            return options;
+                        }
                     }
                 }
             }
@@ -1425,6 +1485,79 @@ impl CheckoutService {
                 extra: HashMap::new(),
             },
         ]
+    }
+
+    fn tax_address_from_fulfillment(
+        &self,
+        fulfillment: &Fulfillment,
+    ) -> Option<stateset_embedded::TaxAddress> {
+        let methods = fulfillment.methods.as_ref()?;
+
+        for method in methods {
+            let destinations = method.destinations.as_ref()?;
+            let selected = method
+                .selected_destination_id
+                .as_ref()
+                .and_then(|id| destinations.iter().find(|dest| dest.id.as_ref() == Some(id)))
+                .or_else(|| destinations.first());
+
+            if let Some(destination) = selected {
+                if let Some(address) = self.tax_address_from_destination(&destination.data) {
+                    return Some(address);
+                }
+            }
+        }
+
+        None
+    }
+
+    fn tax_address_from_destination(
+        &self,
+        data: &HashMap<String, serde_json::Value>,
+    ) -> Option<stateset_embedded::TaxAddress> {
+        let nested = data
+            .get("address")
+            .or_else(|| data.get("postal_address"))
+            .or_else(|| data.get("shipping_address"))
+            .and_then(|value| value.as_object());
+
+        let get_str = |key: &str| -> Option<String> {
+            if let Some(map) = nested {
+                if let Some(value) = map.get(key).and_then(|value| value.as_str()) {
+                    return Some(value.to_string());
+                }
+            }
+            data.get(key)
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string())
+        };
+
+        let country = get_str("address_country").or_else(|| get_str("country"));
+        let state = get_str("address_region").or_else(|| get_str("state"));
+        let city = get_str("address_locality").or_else(|| get_str("city"));
+        let postal_code = get_str("postal_code");
+        let line1 = get_str("street_address").or_else(|| get_str("line1"));
+        let line2 = get_str("extended_address").or_else(|| get_str("line2"));
+
+        let has_any = country.is_some()
+            || state.is_some()
+            || city.is_some()
+            || postal_code.is_some()
+            || line1.is_some()
+            || line2.is_some();
+
+        if !has_any {
+            return None;
+        }
+
+        Some(stateset_embedded::TaxAddress {
+            country: country.unwrap_or_else(|| "US".to_string()),
+            state,
+            city,
+            postal_code,
+            line1,
+            line2,
+        })
     }
 
     fn selected_fulfillment_cost(&self, fulfillment: &Fulfillment) -> i64 {

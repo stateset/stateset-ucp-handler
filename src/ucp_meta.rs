@@ -1,8 +1,10 @@
 use crate::models::CheckoutResponse;
+use crate::models::Order;
 use crate::negotiation::NegotiatedCapabilities;
 use std::collections::HashSet;
 
 pub const AP2_MANDATE_CAPABILITY: &str = "dev.ucp.shopping.ap2_mandate";
+pub const ORDER_CAPABILITY: &str = "dev.ucp.shopping.order";
 
 pub fn requires_ap2_mandate(
     negotiated: Option<&NegotiatedCapabilities>,
@@ -34,6 +36,23 @@ pub fn apply_negotiated_checkout(
     }
 }
 
+pub fn apply_negotiated_order(
+    order: &mut Order,
+    negotiated: Option<&NegotiatedCapabilities>,
+) {
+    let Some(negotiated) = negotiated else {
+        return;
+    };
+
+    order.ucp.version = negotiated.version.clone();
+
+    let allowed = negotiated_capability_names(negotiated);
+    order
+        .ucp
+        .capabilities
+        .retain(|capability| allowed.contains(capability.name.as_str()));
+}
+
 pub fn has_capability(negotiated: &NegotiatedCapabilities, name: &str) -> bool {
     negotiated
         .capabilities
@@ -56,7 +75,8 @@ mod tests {
     use super::*;
     use crate::models::{
         Ap2CheckoutResponse, CapabilityRef, CheckoutResponse, CheckoutStatus, ItemResponse,
-        LineItemResponse, PaymentResponse, Total, UcpResponseMeta,
+        LineItemResponse, Order, OrderFulfillment, OrderLineItem, OrderQuantity, PaymentResponse,
+        Total, UcpResponseMeta,
     };
     use std::collections::HashMap;
 
@@ -141,5 +161,76 @@ mod tests {
             "dev.ucp.shopping.checkout"
         );
         assert!(checkout.ap2.is_none());
+    }
+
+    #[test]
+    fn apply_negotiated_order_filters_capabilities() {
+        let negotiated = NegotiatedCapabilities {
+            version: "2026-01-11".to_string(),
+            capabilities: vec![CapabilityRef {
+                name: "dev.ucp.shopping.order".to_string(),
+                version: "2026-01-11".to_string(),
+            }],
+            platform_signing_keys: Vec::new(),
+            platform_webhook_url: None,
+        };
+
+        let mut order = Order {
+            ucp: UcpResponseMeta {
+                version: "2026-01-11".to_string(),
+                capabilities: vec![
+                    CapabilityRef {
+                        name: "dev.ucp.shopping.order".to_string(),
+                        version: "2026-01-11".to_string(),
+                    },
+                    CapabilityRef {
+                        name: AP2_MANDATE_CAPABILITY.to_string(),
+                        version: "2026-01-11".to_string(),
+                    },
+                ],
+            },
+            id: "order_1".to_string(),
+            checkout_id: "chk_1".to_string(),
+            permalink_url: "https://example.com/orders/order_1".to_string(),
+            line_items: vec![OrderLineItem {
+                id: "li_1".to_string(),
+                item: ItemResponse {
+                    id: "item_1".to_string(),
+                    title: "Widget".to_string(),
+                    price: 1000,
+                    image_url: None,
+                    extra: HashMap::new(),
+                },
+                quantity: OrderQuantity {
+                    total: 1,
+                    fulfilled: 0,
+                },
+                totals: vec![Total {
+                    total_type: "total".to_string(),
+                    display_text: None,
+                    amount: 1000,
+                }],
+                status: "processing".to_string(),
+                parent_id: None,
+                extra: HashMap::new(),
+            }],
+            fulfillment: OrderFulfillment {
+                expectations: None,
+                events: None,
+            },
+            totals: vec![Total {
+                total_type: "total".to_string(),
+                display_text: None,
+                amount: 1000,
+            }],
+            adjustments: None,
+            extra: HashMap::new(),
+        };
+
+        apply_negotiated_order(&mut order, Some(&negotiated));
+
+        assert_eq!(order.ucp.version, "2026-01-11");
+        assert_eq!(order.ucp.capabilities.len(), 1);
+        assert_eq!(order.ucp.capabilities[0].name, ORDER_CAPABILITY);
     }
 }

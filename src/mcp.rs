@@ -220,12 +220,8 @@ impl McpHandler {
         id: &Value,
     ) -> Option<JsonRpcResponse> {
         let mut store = self.idempotency.write().await;
+        store.retain(|_, record| record.created_at.elapsed() <= self.idempotency_ttl);
         if let Some(record) = store.get(idempotency_key) {
-            if record.created_at.elapsed() > self.idempotency_ttl {
-                store.remove(idempotency_key);
-                return None;
-            }
-
             if record.request_hash != request_hash {
                 return Some(self.error_response(
                     id.clone(),
@@ -251,6 +247,7 @@ impl McpHandler {
         response: JsonRpcResponse,
     ) {
         let mut store = self.idempotency.write().await;
+        store.retain(|_, record| record.created_at.elapsed() <= self.idempotency_ttl);
         store.insert(
             idempotency_key,
             McpIdempotencyRecord {

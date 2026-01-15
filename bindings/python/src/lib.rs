@@ -61,6 +61,7 @@ impl CheckoutService {
         let service = RustCheckoutService::new(
             store,
             catalog,
+            None,
             event_sender,
             ucp_version,
             service_version,
@@ -70,6 +71,9 @@ impl CheckoutService {
             None,
             identity_linking_enabled.unwrap_or(false),
             buyer_consent_enabled.unwrap_or(false),
+            false,
+            false,
+            false,
             ap2_enabled.unwrap_or(false),
             ap2_merchant_authorization,
             None,
