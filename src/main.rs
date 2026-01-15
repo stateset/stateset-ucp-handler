@@ -197,6 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let response_signing_key = ap2_signing_key.clone().map(Arc::new);
+    let webhook_signing_key = ap2_signing_key.clone();
 
     let oauth_service = if config.oauth_enabled {
         Some(Arc::new(OAuthService::new(OAuthConfig {
@@ -266,11 +267,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.base_url.clone(),
     ));
 
-    // Profile cache for platform profile negotiation (1 hour TTL)
-    let profile_cache = Arc::new(ProfileCache::new_with_timeout(
-        Duration::from_secs(config.profile_cache_ttl_seconds),
-        Duration::from_secs(config.profile_fetch_timeout_seconds),
-    ));
+    // Profile cache for platform profile negotiation
+    let profile_cache = if config.profile_fetch_timeout_seconds == 10 {
+        Arc::new(ProfileCache::new(Duration::from_secs(
+            config.profile_cache_ttl_seconds,
+        )))
+    } else {
+        Arc::new(ProfileCache::new_with_timeout(
+            Duration::from_secs(config.profile_cache_ttl_seconds),
+            Duration::from_secs(config.profile_fetch_timeout_seconds),
+        ))
+    };
 
     // MCP handler for JSON-RPC transport
     let mcp_handler = Arc::new(McpHandler::new(service.clone()));
@@ -306,17 +313,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     webhook_options.max_retries = config.webhook_max_retries;
     webhook_options.retry_backoff = Duration::from_millis(config.webhook_retry_base_ms);
 
-    let webhook_sender = OrderWebhook::new_with_options(
+    let mut webhook_sender = OrderWebhook::new_with_options(
         config.order_webhook_url.clone(),
         config.order_webhook_api_key.clone(),
         config.webhook_signature.clone(),
         webhook_options,
     );
+    if let Some(signing_key) = webhook_signing_key {
+        webhook_sender.set_signing_key(signing_key);
+    }
 
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
             match event {
-                Event::OrderCreated { order } => {
+                Event::OrderCreated { order, webhook_url } => {
                     order_store.insert(order.clone()).await;
                     let order_event = OrderEvent {
                         order,
@@ -324,7 +334,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         created_time: chrono::Utc::now().to_rfc3339(),
                     };
 
-                    if let Err(err) = webhook_sender.send_order_event(&order_event).await {
+                    if let Err(err) = webhook_sender
+                        .send_order_event(&order_event, webhook_url.as_deref())
+                        .await
+                    {
                         warn!("Failed to deliver order event webhook: {}", err);
                     }
                 }
@@ -441,6 +454,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
     info!("UCP handler listening on {}", addr);
 
+    let grpc_enabled = config.grpc_port != 0;
     let grpc_addr: SocketAddr = format!("{}:{}", config.grpc_host, config.grpc_port).parse()?;
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -469,6 +483,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let grpc_server = async move {
+        if !grpc_enabled {
+            return Ok::<(), Box<dyn std::error::Error>>(());
+        }
+
         grpc::serve(grpc_addr, grpc_state, async move {
             let _ = grpc_shutdown_rx.recv().await;
         })
@@ -507,6 +525,14 @@ async fn create_checkout(
         .map_err(ApiError::from_service)?;
 
     apply_negotiated_checkout(&mut checkout, Some(&context.negotiated));
+    state
+        .service
+        .record_negotiated_checkout(
+            &checkout.id,
+            &context.negotiated.version,
+            &context.negotiated.capabilities,
+        )
+        .await;
 
     build_json_response(
         StatusCode::CREATED,
@@ -529,6 +555,14 @@ async fn get_checkout(
         .map_err(ApiError::from_service)?;
 
     apply_negotiated_checkout(&mut checkout, Some(&context.negotiated));
+    state
+        .service
+        .record_negotiated_checkout(
+            &checkout.id,
+            &context.negotiated.version,
+            &context.negotiated.capabilities,
+        )
+        .await;
 
     build_json_response(
         StatusCode::OK,
@@ -552,6 +586,14 @@ async fn update_checkout(
         .map_err(ApiError::from_service)?;
 
     apply_negotiated_checkout(&mut checkout, Some(&context.negotiated));
+    state
+        .service
+        .record_negotiated_checkout(
+            &checkout.id,
+            &context.negotiated.version,
+            &context.negotiated.capabilities,
+        )
+        .await;
 
     build_json_response(
         StatusCode::OK,
@@ -574,11 +616,25 @@ async fn complete_checkout(
     );
     let mut checkout = state
         .service
-        .complete_checkout_with_requirements(&checkout_id, payload, require_ap2)
+        .complete_checkout_with_requirements(
+            &checkout_id,
+            payload,
+            require_ap2,
+            context.negotiated.platform_webhook_url.clone(),
+            Some(context.negotiated.platform_signing_keys.as_slice()),
+        )
         .await
         .map_err(ApiError::from_service)?;
 
     apply_negotiated_checkout(&mut checkout, Some(&context.negotiated));
+    state
+        .service
+        .record_negotiated_checkout(
+            &checkout.id,
+            &context.negotiated.version,
+            &context.negotiated.capabilities,
+        )
+        .await;
 
     build_json_response(
         StatusCode::OK,
@@ -601,6 +657,14 @@ async fn cancel_checkout(
         .map_err(ApiError::from_service)?;
 
     apply_negotiated_checkout(&mut checkout, Some(&context.negotiated));
+    state
+        .service
+        .record_negotiated_checkout(
+            &checkout.id,
+            &context.negotiated.version,
+            &context.negotiated.capabilities,
+        )
+        .await;
 
     build_json_response(
         StatusCode::OK,
@@ -865,7 +929,7 @@ async fn request_signature_middleware(
             .filter(|raw| !raw.is_empty())
     });
 
-    if signature_header.is_none() && !state.require_request_signature {
+    if !state.require_request_signature {
         return next.run(request).await;
     }
 
@@ -1043,13 +1107,15 @@ fn verify_request_signature(
         .header()
         .map_err(|err| format!("Invalid JWS header: {}", err))?;
 
-    let candidates: Vec<&crypto::VerifyingKey> = match header.kid.as_deref() {
-        Some(kid) => keys.iter().filter(|key| key.kid == kid).collect(),
-        None => keys.iter().collect(),
-    };
+    let kid = header
+        .kid
+        .as_deref()
+        .ok_or_else(|| "Request-Signature header must include kid".to_string())?;
+    let candidates: Vec<&crypto::VerifyingKey> =
+        keys.iter().filter(|key| key.kid == kid).collect();
 
     if candidates.is_empty() {
-        return Err("No matching signing key found for Request-Signature".to_string());
+        return Err("No matching signing key found for Request-Signature kid".to_string());
     }
 
     for key in candidates {
@@ -1351,13 +1417,25 @@ async fn embedded_checkout(
         }
     }
 
-    let checkout = match state.service.get_checkout(&checkout_id).await {
+    let mut checkout = match state.service.get_checkout(&checkout_id).await {
         Ok(checkout) => checkout,
         Err(err) => {
             let page = embedded_error_page("Checkout Not Found", &err.to_string());
             return (StatusCode::NOT_FOUND, Html(page));
         }
     };
+
+    if let Some((version, capabilities)) =
+        state.service.negotiated_for_checkout(&checkout_id).await
+    {
+        let negotiated = NegotiatedCapabilities {
+            version,
+            capabilities,
+            platform_signing_keys: Vec::new(),
+            platform_webhook_url: None,
+        };
+        apply_negotiated_checkout(&mut checkout, Some(&negotiated));
+    }
 
     let requested_delegations = params.requested_delegations();
     let accepted = accepted_delegations(&requested_delegations);

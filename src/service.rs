@@ -3,16 +3,19 @@
 //! Handles checkout lifecycle, totals/discounts, and optional AP2/identity features.
 
 use crate::catalog::ProductCatalog;
-use crate::crypto::{canonicalize, sign_detached_b64, SigningKey};
+use crate::crypto::{
+    canonicalize, sign_detached_b64, verify_compact_jws, verify_detached_b64,
+    verifying_key_from_signing, CompactJws, DetachedJws, SigningKey, VerifyingKey,
+};
 use crate::errors::ServiceError;
 use crate::events::{Event, EventSender};
 use crate::models::{
-    AppliedDiscount, Ap2CheckoutResponse, Capability, CheckoutCompleteRequest, CheckoutCreateRequest,
-    CheckoutResponse, CheckoutStatus, CheckoutUpdateRequest, DiscountAllocation, DiscountsObject,
-    Fulfillment, FulfillmentAvailableMethod, FulfillmentGroup, FulfillmentMethod,
-    FulfillmentOption, LineItemInput, LineItemResponse, Link, Message, Order, OrderConfirmation,
-    OrderFulfillment, OrderLineItem, OrderQuantity, PaymentHandler, PaymentInstrument,
-    PaymentRequest, PaymentResponse, Total, UcpResponseMeta,
+    AppliedDiscount, Ap2CheckoutResponse, Capability, CapabilityRef, CheckoutCompleteRequest,
+    CheckoutCreateRequest, CheckoutResponse, CheckoutStatus, CheckoutUpdateRequest,
+    DiscountAllocation, DiscountsObject, Fulfillment, FulfillmentAvailableMethod, FulfillmentGroup,
+    FulfillmentMethod, FulfillmentOption, LineItemInput, LineItemResponse, Link, Message, Order,
+    OrderConfirmation, OrderFulfillment, OrderLineItem, OrderQuantity, PaymentHandler,
+    PaymentInstrument, PaymentRequest, PaymentResponse, Total, UcpResponseMeta,
 };
 use crate::store::CheckoutStore;
 use crate::validation::{normalize_currency, validate_checkout_id, validate_quantity};
@@ -35,7 +38,7 @@ pub trait Ap2MandateVerifier: Send + Sync {
     fn verify(&self, mandate: &str) -> Result<(), ServiceError>;
 }
 
-/// AP2 verifier that only validates detached JWS formatting.
+/// AP2 verifier that only validates SD-JWT+kb formatting.
 #[derive(Default)]
 pub struct FormatOnlyAp2MandateVerifier;
 
@@ -48,19 +51,85 @@ impl Ap2MandateVerifier for FormatOnlyAp2MandateVerifier {
             ));
         }
 
-        let mut parts = trimmed.splitn(3, '.');
-        let header = parts.next().unwrap_or_default();
-        let payload = parts.next().unwrap_or_default();
-        let signature = parts.next().unwrap_or_default();
-
-        if header.is_empty() || payload.is_empty() || signature.is_empty() {
+        if !is_sd_jwt_kb_format(trimmed) {
             return Err(ServiceError::InvalidInput(
-                "ap2.checkout_mandate must be a detached JWS".to_string(),
+                "ap2.checkout_mandate must be a valid SD-JWT+kb token".to_string(),
             ));
         }
 
         Ok(())
     }
+}
+
+fn is_sd_jwt_kb_format(value: &str) -> bool {
+    let mut parts = value.split('~');
+    let jwt = parts.next().unwrap_or("");
+
+    let mut jwt_parts = jwt.split('.');
+    let header = jwt_parts.next().unwrap_or("");
+    let payload = jwt_parts.next().unwrap_or("");
+    let signature = jwt_parts.next().unwrap_or("");
+
+    if jwt_parts.next().is_some() {
+        return false;
+    }
+
+    if header.is_empty() || signature.is_empty() {
+        return false;
+    }
+
+    if !is_base64url_segment(header) {
+        return false;
+    }
+
+    if !payload.chars().all(is_base64url_char) {
+        return false;
+    }
+
+    if !is_base64url_segment(signature) {
+        return false;
+    }
+
+    for disclosure in parts {
+        if !is_base64url_segment(disclosure) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn is_base64url_segment(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(is_base64url_char)
+}
+
+fn is_base64url_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'
+}
+
+fn checkout_value_without_ap2(
+    checkout: &CheckoutResponse,
+) -> Result<serde_json::Value, ServiceError> {
+    let mut checkout_value = serde_json::to_value(checkout)
+        .map_err(|err| ServiceError::InvalidInput(err.to_string()))?;
+    if let Some(obj) = checkout_value.as_object_mut() {
+        obj.remove("ap2");
+    }
+    Ok(checkout_value)
+}
+
+fn is_card_credential(credential: &serde_json::Value) -> bool {
+    let Some(obj) = credential.as_object() else {
+        return false;
+    };
+
+    if let Some(cred_type) = obj.get("type").and_then(|value| value.as_str()) {
+        if cred_type == "card" {
+            return true;
+        }
+    }
+
+    obj.contains_key("card_number_type")
 }
 
 struct DiscountOutcome {
@@ -251,6 +320,26 @@ impl CheckoutService {
             .ok_or_else(|| ServiceError::NotFound(format!("Checkout {} not found", checkout_id)))
     }
 
+    /// Record negotiated capabilities for a checkout session.
+    pub async fn record_negotiated_checkout(
+        &self,
+        checkout_id: &str,
+        version: &str,
+        capabilities: &[CapabilityRef],
+    ) {
+        self.store
+            .set_negotiated(checkout_id, version.to_string(), capabilities.to_vec())
+            .await;
+    }
+
+    /// Get negotiated capabilities for a checkout session, if recorded.
+    pub async fn negotiated_for_checkout(
+        &self,
+        checkout_id: &str,
+    ) -> Option<(String, Vec<CapabilityRef>)> {
+        self.store.get_negotiated(checkout_id).await
+    }
+
     /// Update a checkout session, re-evaluating totals/requirements.
     pub async fn update_checkout(
         &self,
@@ -343,8 +432,14 @@ impl CheckoutService {
         checkout_id: &str,
         request: CheckoutCompleteRequest,
     ) -> Result<CheckoutResponse, ServiceError> {
-        self.complete_checkout_with_requirements(checkout_id, request, self.ap2_enabled)
-            .await
+        self.complete_checkout_with_requirements(
+            checkout_id,
+            request,
+            self.ap2_enabled,
+            None,
+            None,
+        )
+        .await
     }
 
     /// Complete a checkout session with validation requirements.
@@ -353,6 +448,8 @@ impl CheckoutService {
         checkout_id: &str,
         request: CheckoutCompleteRequest,
         require_ap2_mandate: bool,
+        webhook_url: Option<String>,
+        platform_signing_keys: Option<&[VerifyingKey]>,
     ) -> Result<CheckoutResponse, ServiceError> {
         let mut checkout = self.get_checkout(checkout_id).await?;
 
@@ -381,6 +478,17 @@ impl CheckoutService {
                 .map(|ap2| ap2.checkout_mandate.as_str())
                 .unwrap_or_default();
             self.ap2_mandate_verifier.verify(mandate)?;
+            let platform_keys = platform_signing_keys.ok_or_else(|| {
+                ServiceError::InvalidInput(
+                    "ap2.checkout_mandate requires platform signing keys".to_string(),
+                )
+            })?;
+            if platform_keys.is_empty() {
+                return Err(ServiceError::InvalidInput(
+                    "ap2.checkout_mandate requires platform signing keys".to_string(),
+                ));
+            }
+            self.verify_ap2_mandate(mandate, &checkout, platform_keys)?;
         }
 
         self.attach_payment_data(&mut checkout, request.payment_data)?;
@@ -400,15 +508,16 @@ impl CheckoutService {
             extra: HashMap::new(),
         });
 
-        checkout.ap2 = self.ap2_response();
         checkout.status = CheckoutStatus::Completed;
         checkout.messages = None;
+        checkout.continue_url = None;
+        checkout.ap2 = self.ap2_response_for_checkout(&checkout);
 
         let ttl = Duration::from_secs(self.session_ttl_seconds);
         self.store.insert(checkout.clone(), Some(ttl)).await;
 
         self.event_sender
-            .send(Event::OrderCreated { order })
+            .send(Event::OrderCreated { order, webhook_url })
             .await;
 
         Ok(checkout)
@@ -617,22 +726,6 @@ impl CheckoutService {
         }
     }
 
-    fn ap2_response(&self) -> Option<Ap2CheckoutResponse> {
-        if !self.ap2_enabled {
-            return None;
-        }
-
-        // If we have a static merchant_authorization, use it (legacy mode)
-        if let Some(authorization) = &self.ap2_merchant_authorization {
-            return Some(Ap2CheckoutResponse {
-                merchant_authorization: authorization.clone(),
-            });
-        }
-
-        // Otherwise, we'll generate it dynamically per checkout in ap2_response_for_checkout
-        None
-    }
-
     /// Generates AP2 merchant authorization for a specific checkout.
     /// This creates a detached JWS signature over the canonicalized checkout data.
     fn ap2_response_for_checkout(&self, checkout: &CheckoutResponse) -> Option<Ap2CheckoutResponse> {
@@ -663,6 +756,150 @@ impl CheckoutService {
         Some(Ap2CheckoutResponse {
             merchant_authorization: jws.to_compact(),
         })
+    }
+
+    fn verify_ap2_mandate(
+        &self,
+        mandate: &str,
+        checkout: &CheckoutResponse,
+        platform_keys: &[VerifyingKey],
+    ) -> Result<(), ServiceError> {
+        let payload = self.verify_sd_jwt_signature(mandate, platform_keys)?;
+        self.verify_sd_jwt_claims(&payload, checkout)?;
+        self.verify_merchant_authorization(checkout)?;
+        Ok(())
+    }
+
+    fn verify_sd_jwt_signature(
+        &self,
+        mandate: &str,
+        platform_keys: &[VerifyingKey],
+    ) -> Result<serde_json::Value, ServiceError> {
+        let sd_jwt = mandate.split('~').next().unwrap_or("").trim();
+        if sd_jwt.is_empty() {
+            return Err(ServiceError::InvalidInput(
+                "ap2.checkout_mandate is missing SD-JWT header".to_string(),
+            ));
+        }
+
+        let compact = CompactJws::from_compact(sd_jwt)
+            .map_err(|err| ServiceError::InvalidInput(err.to_string()))?;
+        let header = compact
+            .header()
+            .map_err(|err| ServiceError::InvalidInput(err.to_string()))?;
+        let kid = header.kid.as_deref().ok_or_else(|| {
+            ServiceError::InvalidInput(
+                "ap2.checkout_mandate header must include kid".to_string(),
+            )
+        })?;
+
+        let candidates: Vec<&VerifyingKey> = platform_keys
+            .iter()
+            .filter(|key| key.kid == kid)
+            .collect();
+        if candidates.is_empty() {
+            return Err(ServiceError::InvalidInput(
+                "ap2.checkout_mandate signing key not found".to_string(),
+            ));
+        }
+
+        for key in candidates {
+            if verify_compact_jws(&compact, key).is_ok() {
+                return compact
+                    .payload_json()
+                    .map_err(|err| ServiceError::InvalidInput(err.to_string()));
+            }
+        }
+
+        Err(ServiceError::InvalidInput(
+            "ap2.checkout_mandate signature verification failed".to_string(),
+        ))
+    }
+
+    fn verify_sd_jwt_claims(
+        &self,
+        payload: &serde_json::Value,
+        checkout: &CheckoutResponse,
+    ) -> Result<(), ServiceError> {
+        let now = Utc::now().timestamp();
+        if let Some(exp) = payload.get("exp").and_then(|value| value.as_i64()) {
+            if exp <= now {
+                return Err(ServiceError::InvalidInput(
+                    "ap2.checkout_mandate is expired".to_string(),
+                ));
+            }
+        }
+
+        if let Some(checkout_id) = payload
+            .get("checkout_id")
+            .and_then(|value| value.as_str())
+        {
+            if checkout_id != checkout.id {
+                return Err(ServiceError::InvalidInput(
+                    "ap2.checkout_mandate checkout_id mismatch".to_string(),
+                ));
+            }
+        }
+
+        if let Some(checkout_value) = payload.get("checkout") {
+            if let Some(id) = checkout_value.get("id").and_then(|value| value.as_str()) {
+                if id != checkout.id {
+                    return Err(ServiceError::InvalidInput(
+                        "ap2.checkout_mandate checkout mismatch".to_string(),
+                    ));
+                }
+            }
+            if let Some(merchant_auth) = checkout_value
+                .get("ap2")
+                .and_then(|value| value.get("merchant_authorization"))
+                .and_then(|value| value.as_str())
+            {
+                if let Some(current) = checkout
+                    .ap2
+                    .as_ref()
+                    .map(|ap2| ap2.merchant_authorization.as_str())
+                {
+                    if merchant_auth != current {
+                        return Err(ServiceError::InvalidInput(
+                            "ap2.checkout_mandate merchant_authorization mismatch".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn verify_merchant_authorization(
+        &self,
+        checkout: &CheckoutResponse,
+    ) -> Result<(), ServiceError> {
+        let ap2 = checkout.ap2.as_ref().ok_or_else(|| {
+            ServiceError::InvalidInput("ap2.merchant_authorization is required".to_string())
+        })?;
+
+        if let Some(expected) = self.ap2_merchant_authorization.as_ref() {
+            if ap2.merchant_authorization != *expected {
+                return Err(ServiceError::InvalidInput(
+                    "ap2.merchant_authorization mismatch".to_string(),
+                ));
+            }
+            return Ok(());
+        }
+
+        let signing_key = self.ap2_signing_key.as_ref().ok_or_else(|| {
+            ServiceError::InvalidInput("ap2 signing key is not configured".to_string())
+        })?;
+        let verifying_key = verifying_key_from_signing(signing_key);
+        let jws = DetachedJws::from_compact(&ap2.merchant_authorization)
+            .map_err(|err| ServiceError::InvalidInput(err.to_string()))?;
+        let checkout_value = checkout_value_without_ap2(checkout)?;
+        let canonical =
+            canonicalize(&checkout_value).map_err(|err| ServiceError::InvalidInput(err.to_string()))?;
+
+        verify_detached_b64(&jws, &canonical, &verifying_key)
+            .map_err(|err| ServiceError::InvalidInput(err.to_string()))
     }
 
     fn build_line_items(
@@ -1800,6 +2037,15 @@ impl CheckoutService {
             return Err(ServiceError::InvalidInput(
                 "payment_data.id is required".to_string(),
             ));
+        }
+
+        if let Some(credential) = payment_data.credential.as_ref() {
+            if is_card_credential(credential) {
+                return Err(ServiceError::InvalidInput(
+                    "payment_data.credential must be tokenized; card credentials are not permitted"
+                        .to_string(),
+                ));
+            }
         }
 
         let payment = &mut checkout.payment;

@@ -23,6 +23,10 @@ use tokio::sync::RwLock;
 struct UcpOverlay {
     /// UCP capabilities for this checkout
     capabilities: Vec<CapabilityRef>,
+    /// Negotiated UCP version for this checkout (if available)
+    negotiated_version: Option<String>,
+    /// Negotiated capabilities for this checkout (if available)
+    negotiated_capabilities: Option<Vec<CapabilityRef>>,
     /// Payment handlers configuration
     payment_handlers: Vec<PaymentHandler>,
     /// UCP version string
@@ -109,11 +113,27 @@ impl CheckoutStore {
 
         // Store UCP overlay
         {
+            let existing = {
+                let overlays = self.overlays.read().await;
+                overlays
+                    .get(&checkout_id)
+                    .map(|overlay| {
+                        (
+                            overlay.negotiated_version.clone(),
+                            overlay.negotiated_capabilities.clone(),
+                        )
+                    })
+            };
+            let (negotiated_version, negotiated_capabilities) =
+                existing.unwrap_or((None, None));
+
             let mut overlays = self.overlays.write().await;
             overlays.insert(
                 checkout_id.clone(),
                 UcpOverlay {
                     capabilities: checkout.ucp.capabilities.clone(),
+                    negotiated_version,
+                    negotiated_capabilities,
                     payment_handlers: checkout.payment.handlers.clone(),
                     ucp_version: checkout.ucp.version.clone(),
                     fulfillment: checkout.fulfillment.clone(),
@@ -194,6 +214,39 @@ impl CheckoutStore {
         }
 
         None
+    }
+
+    /// Store negotiated capabilities for a checkout session.
+    pub async fn set_negotiated(
+        &self,
+        checkout_id: &str,
+        version: String,
+        capabilities: Vec<CapabilityRef>,
+    ) {
+        let mut overlays = self.overlays.write().await;
+        if let Some(overlay) = overlays.get_mut(checkout_id) {
+            overlay.negotiated_version = Some(version);
+            overlay.negotiated_capabilities = Some(capabilities);
+        }
+    }
+
+    /// Get negotiated capabilities for a checkout session, if stored.
+    pub async fn get_negotiated(
+        &self,
+        checkout_id: &str,
+    ) -> Option<(String, Vec<CapabilityRef>)> {
+        let overlays = self.overlays.read().await;
+        overlays.get(checkout_id).and_then(|overlay| {
+            overlay.negotiated_version.as_ref().map(|version| {
+                (
+                    version.clone(),
+                    overlay
+                        .negotiated_capabilities
+                        .clone()
+                        .unwrap_or_default(),
+                )
+            })
+        })
     }
 
     /// Remove a checkout session

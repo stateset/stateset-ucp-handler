@@ -758,6 +758,15 @@ impl A2AHandler {
         let request: CheckoutCreateRequest = serde_json::from_value(data)
             .map_err(|e| ServiceError::InvalidInput(format!("Invalid request: {}", e)))?;
         let mut checkout = self.service.create_checkout(request).await?;
+        if let Some(negotiated) = negotiated {
+            self.service
+                .record_negotiated_checkout(
+                    &checkout.id,
+                    &negotiated.version,
+                    &negotiated.capabilities,
+                )
+                .await;
+        }
         apply_negotiated_checkout(&mut checkout, negotiated);
         serde_json::to_value(&checkout)
             .map_err(|e| ServiceError::External(format!("Serialization error: {}", e)))
@@ -775,6 +784,15 @@ impl A2AHandler {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ServiceError::InvalidInput("Missing checkout_id".to_string()))?;
         let mut checkout = self.service.get_checkout(checkout_id).await?;
+        if let Some(negotiated) = negotiated {
+            self.service
+                .record_negotiated_checkout(
+                    &checkout.id,
+                    &negotiated.version,
+                    &negotiated.capabilities,
+                )
+                .await;
+        }
         apply_negotiated_checkout(&mut checkout, negotiated);
         serde_json::to_value(&checkout)
             .map_err(|e| ServiceError::External(format!("Serialization error: {}", e)))
@@ -794,6 +812,15 @@ impl A2AHandler {
         let request: CheckoutUpdateRequest = serde_json::from_value(data)
             .map_err(|e| ServiceError::InvalidInput(format!("Invalid request: {}", e)))?;
         let mut checkout = self.service.update_checkout(&checkout_id, request).await?;
+        if let Some(negotiated) = negotiated {
+            self.service
+                .record_negotiated_checkout(
+                    &checkout.id,
+                    &negotiated.version,
+                    &negotiated.capabilities,
+                )
+                .await;
+        }
         apply_negotiated_checkout(&mut checkout, negotiated);
         serde_json::to_value(&checkout)
             .map_err(|e| ServiceError::External(format!("Serialization error: {}", e)))
@@ -814,10 +841,26 @@ impl A2AHandler {
         let request: CheckoutCompleteRequest = serde_json::from_value(data)
             .map_err(|e| ServiceError::InvalidInput(format!("Invalid request: {}", e)))?;
         let require_ap2 = requires_ap2_mandate(negotiated, self.service.ap2_enabled());
+        let webhook_url = negotiated.and_then(|caps| caps.platform_webhook_url.clone());
         let mut checkout = self
             .service
-            .complete_checkout_with_requirements(&checkout_id, request, require_ap2)
+            .complete_checkout_with_requirements(
+                &checkout_id,
+                request,
+                require_ap2,
+                webhook_url,
+                negotiated.map(|caps| caps.platform_signing_keys.as_slice()),
+            )
             .await?;
+        if let Some(negotiated) = negotiated {
+            self.service
+                .record_negotiated_checkout(
+                    &checkout.id,
+                    &negotiated.version,
+                    &negotiated.capabilities,
+                )
+                .await;
+        }
         apply_negotiated_checkout(&mut checkout, negotiated);
         serde_json::to_value(&checkout)
             .map_err(|e| ServiceError::External(format!("Serialization error: {}", e)))
@@ -836,6 +879,15 @@ impl A2AHandler {
             .ok_or_else(|| ServiceError::InvalidInput("Missing checkout_id".to_string()))?
             .to_string();
         let mut checkout = self.service.cancel_checkout(&checkout_id).await?;
+        if let Some(negotiated) = negotiated {
+            self.service
+                .record_negotiated_checkout(
+                    &checkout.id,
+                    &negotiated.version,
+                    &negotiated.capabilities,
+                )
+                .await;
+        }
         apply_negotiated_checkout(&mut checkout, negotiated);
         serde_json::to_value(&checkout)
             .map_err(|e| ServiceError::External(format!("Serialization error: {}", e)))

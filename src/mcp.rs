@@ -327,6 +327,15 @@ impl McpHandler {
 
         let response = match self.service.create_checkout(create_request).await {
             Ok(mut checkout) => {
+                if let Some(negotiated) = negotiated {
+                    self.service
+                        .record_negotiated_checkout(
+                            &checkout.id,
+                            &negotiated.version,
+                            &negotiated.capabilities,
+                        )
+                        .await;
+                }
                 apply_negotiated_checkout(&mut checkout, negotiated);
                 self.success_response(request.id, &checkout)
             }
@@ -361,6 +370,15 @@ impl McpHandler {
 
         match self.service.get_checkout(&checkout_id).await {
             Ok(mut checkout) => {
+                if let Some(negotiated) = negotiated {
+                    self.service
+                        .record_negotiated_checkout(
+                            &checkout.id,
+                            &negotiated.version,
+                            &negotiated.capabilities,
+                        )
+                        .await;
+                }
                 apply_negotiated_checkout(&mut checkout, negotiated);
                 self.success_response(request.id, &checkout)
             }
@@ -459,6 +477,15 @@ impl McpHandler {
 
         let response = match self.service.update_checkout(&checkout_id, update_request).await {
             Ok(mut checkout) => {
+                if let Some(negotiated) = negotiated {
+                    self.service
+                        .record_negotiated_checkout(
+                            &checkout.id,
+                            &negotiated.version,
+                            &negotiated.capabilities,
+                        )
+                        .await;
+                }
                 apply_negotiated_checkout(&mut checkout, negotiated);
                 self.success_response(request.id, &checkout)
             }
@@ -616,12 +643,28 @@ impl McpHandler {
             };
 
         let require_ap2 = requires_ap2_mandate(negotiated, self.service.ap2_enabled());
+        let webhook_url = negotiated.and_then(|caps| caps.platform_webhook_url.clone());
         let response = match self
             .service
-            .complete_checkout_with_requirements(&checkout_id, complete_request, require_ap2)
+            .complete_checkout_with_requirements(
+                &checkout_id,
+                complete_request,
+                require_ap2,
+                webhook_url,
+                negotiated.map(|caps| caps.platform_signing_keys.as_slice()),
+            )
             .await
         {
             Ok(mut checkout) => {
+                if let Some(negotiated) = negotiated {
+                    self.service
+                        .record_negotiated_checkout(
+                            &checkout.id,
+                            &negotiated.version,
+                            &negotiated.capabilities,
+                        )
+                        .await;
+                }
                 apply_negotiated_checkout(&mut checkout, negotiated);
                 self.success_response(request.id, &checkout)
             }
@@ -713,6 +756,15 @@ impl McpHandler {
 
         let response = match self.service.cancel_checkout(&checkout_id).await {
             Ok(mut checkout) => {
+                if let Some(negotiated) = negotiated {
+                    self.service
+                        .record_negotiated_checkout(
+                            &checkout.id,
+                            &negotiated.version,
+                            &negotiated.capabilities,
+                        )
+                        .await;
+                }
                 apply_negotiated_checkout(&mut checkout, negotiated);
                 self.success_response(request.id, &checkout)
             }

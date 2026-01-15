@@ -41,6 +41,7 @@ pub struct Config {
     pub token_single_use: bool,
     pub require_ucp_agent: bool,
     pub require_request_signature: bool,
+    pub allow_insecure_urls: bool,
     pub profile_cache_ttl_seconds: u64,
     pub profile_fetch_timeout_seconds: u64,
 
@@ -201,6 +202,19 @@ impl Config {
             .map(|value| parse_env_bool(&value))
             .unwrap_or(true);
 
+        let allow_insecure_urls = std::env::var("UCP_ALLOW_INSECURE_URLS")
+            .ok()
+            .map(|value| parse_env_bool(&value))
+            .unwrap_or_else(|| {
+                base_url.starts_with("http://localhost")
+                    || base_url.starts_with("http://127.0.0.1")
+            });
+
+        if !allow_insecure_urls && base_url.starts_with("http://") {
+            return Err("UCP_PUBLIC_BASE_URL must use https:// unless UCP_ALLOW_INSECURE_URLS=true"
+                .into());
+        }
+
         let profile_cache_ttl_seconds: u64 = std::env::var("UCP_PROFILE_CACHE_TTL_SECONDS")
             .unwrap_or_else(|_| "3600".to_string())
             .parse::<u64>()?
@@ -290,6 +304,7 @@ impl Config {
             token_single_use,
             require_ucp_agent,
             require_request_signature,
+            allow_insecure_urls,
             profile_cache_ttl_seconds,
             profile_fetch_timeout_seconds,
             commerce_enabled,
@@ -372,6 +387,7 @@ mod tests {
             "UCP_TOKEN_SINGLE_USE",
             "UCP_REQUIRE_UCP_AGENT",
             "UCP_REQUIRE_REQUEST_SIGNATURE",
+            "UCP_ALLOW_INSECURE_URLS",
             "UCP_PROFILE_CACHE_TTL_SECONDS",
             "UCP_PROFILE_FETCH_TIMEOUT_SECONDS",
             "UCP_WEBHOOK_TIMEOUT_SECONDS",

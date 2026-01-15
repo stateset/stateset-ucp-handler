@@ -3,7 +3,7 @@ use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
 pub enum Event {
-    OrderCreated { order: Order },
+    OrderCreated { order: Order, webhook_url: Option<String> },
 }
 
 #[derive(Clone)]

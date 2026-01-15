@@ -247,6 +247,7 @@ The proto definition lives at `proto/ucp_handler/v1/ucp_handler.proto`.
 | `GRPC_HOST` | `0.0.0.0` | gRPC bind address |
 | `GRPC_PORT` | `50051` | gRPC server port |
 | `UCP_PUBLIC_BASE_URL` | `http://127.0.0.1:8081` | Public base URL used in discovery responses |
+| `UCP_ALLOW_INSECURE_URLS` | _auto_ | Allow `http://` base URLs (defaults to true for localhost/127.0.0.1) |
 | `UCP_VERSION` | `2026-01-11` | UCP protocol version |
 | `UCP_SERVICE_VERSION` | `2026-01-11` | Service version |
 | `UCP_SESSION_TTL_SECONDS` | `21600` | Checkout TTL (seconds) |
@@ -287,6 +288,10 @@ The proto definition lives at `proto/ucp_handler/v1/ucp_handler.proto`.
 | `USE_ICOMMERCE_TAX` | `true` | Use iCommerce for tax calculation |
 | `USE_ICOMMERCE_PROMOTIONS` | `true` | Use iCommerce for promotions/discounts |
 | `USE_ICOMMERCE_SHIPPING` | `true` | Use iCommerce for shipping rates |
+
+Note: UCP `continue_url` must be an absolute HTTPS URL. Set
+`UCP_PUBLIC_BASE_URL` to `https://...` in production. For local testing, set
+`UCP_ALLOW_INSECURE_URLS=true`.
 
 ## Node.js Bindings
 

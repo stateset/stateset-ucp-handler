@@ -14,6 +14,7 @@ use ecdsa::signature::{Signer, Verifier};
 use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey, VerifyingKey as P256VerifyingKey};
 use p384::ecdsa::{Signature as P384Signature, SigningKey as P384SigningKey, VerifyingKey as P384VerifyingKey};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::cmp::Ordering;
 use std::str::FromStr;
 use thiserror::Error;
@@ -151,6 +152,55 @@ impl DetachedJws {
             .decode(&self.protected)
             .map_err(|e| CryptoError::Base64Error(e.to_string()))?;
         serde_json::from_slice(&header_bytes)
+            .map_err(|e| CryptoError::JsonError(e.to_string()))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CompactJws {
+    pub protected: String,
+    pub payload: String,
+    pub signature: String,
+}
+
+impl CompactJws {
+    pub fn from_compact(compact: &str) -> Result<Self, CryptoError> {
+        let parts: Vec<&str> = compact.split('.').collect();
+        if parts.len() != 3 {
+            return Err(CryptoError::InvalidSignatureFormat(
+                "Expected 3 parts separated by '.'".to_string(),
+            ));
+        }
+        if parts[0].is_empty() || parts[1].is_empty() || parts[2].is_empty() {
+            return Err(CryptoError::InvalidSignatureFormat(
+                "Compact JWS parts must be non-empty".to_string(),
+            ));
+        }
+
+        Ok(CompactJws {
+            protected: parts[0].to_string(),
+            payload: parts[1].to_string(),
+            signature: parts[2].to_string(),
+        })
+    }
+
+    pub fn header(&self) -> Result<JwsHeader, CryptoError> {
+        let header_bytes = URL_SAFE_NO_PAD
+            .decode(&self.protected)
+            .map_err(|e| CryptoError::Base64Error(e.to_string()))?;
+        serde_json::from_slice(&header_bytes)
+            .map_err(|e| CryptoError::JsonError(e.to_string()))
+    }
+
+    pub fn payload_bytes(&self) -> Result<Vec<u8>, CryptoError> {
+        URL_SAFE_NO_PAD
+            .decode(&self.payload)
+            .map_err(|e| CryptoError::Base64Error(e.to_string()))
+    }
+
+    pub fn payload_json(&self) -> Result<Value, CryptoError> {
+        let payload = self.payload_bytes()?;
+        serde_json::from_slice(&payload)
             .map_err(|e| CryptoError::JsonError(e.to_string()))
     }
 }
@@ -561,6 +611,21 @@ pub fn generate_key_pair(algorithm: SigningAlgorithm, kid: String) -> (SigningKe
     }
 }
 
+pub fn verifying_key_from_signing(key: &SigningKey) -> VerifyingKey {
+    match &key.inner {
+        SigningKeyInner::P256(sk) => VerifyingKey {
+            kid: key.kid.clone(),
+            algorithm: key.algorithm,
+            inner: VerifyingKeyInner::P256(*sk.verifying_key()),
+        },
+        SigningKeyInner::P384(sk) => VerifyingKey {
+            kid: key.kid.clone(),
+            algorithm: key.algorithm,
+            inner: VerifyingKeyInner::P384(*sk.verifying_key()),
+        },
+    }
+}
+
 // ============================================================================
 // JWS Signing and Verification
 // ============================================================================
@@ -759,6 +824,64 @@ pub fn verify_detached_b64(
     signing_input.extend_from_slice(jws.protected.as_bytes());
     signing_input.push(b'.');
     signing_input.extend_from_slice(payload_b64.as_bytes());
+
+    let sig_bytes = URL_SAFE_NO_PAD
+        .decode(&jws.signature)
+        .map_err(|e| CryptoError::Base64Error(e.to_string()))?;
+
+    match &key.inner {
+        VerifyingKeyInner::P256(vk) => {
+            let sig = P256Signature::from_bytes(sig_bytes.as_slice().into())
+                .map_err(|e| CryptoError::InvalidSignatureFormat(e.to_string()))?;
+
+            vk.verify(&signing_input, &sig)
+                .map_err(|_| CryptoError::VerificationFailed)?;
+        }
+        VerifyingKeyInner::P384(vk) => {
+            let sig = P384Signature::from_bytes(sig_bytes.as_slice().into())
+                .map_err(|e| CryptoError::InvalidSignatureFormat(e.to_string()))?;
+
+            vk.verify(&signing_input, &sig)
+                .map_err(|_| CryptoError::VerificationFailed)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Verifies a compact JWS signature with base64url-encoded payload.
+pub fn verify_compact_jws(
+    jws: &CompactJws,
+    key: &VerifyingKey,
+) -> Result<(), CryptoError> {
+    let header = jws.header()?;
+    if header.b64 == Some(false) {
+        return Err(CryptoError::InvalidSignatureFormat(
+            "Compact JWS must use base64url-encoded payload".to_string(),
+        ));
+    }
+
+    let alg = header.alg.parse::<SigningAlgorithm>()?;
+    if alg != key.algorithm {
+        return Err(CryptoError::UnsupportedAlgorithm(format!(
+            "Key uses {:?} but JWS uses {}",
+            key.algorithm, header.alg
+        )));
+    }
+
+    if let Some(ref kid) = header.kid {
+        if kid != &key.kid {
+            return Err(CryptoError::KeyIdMismatch {
+                expected: key.kid.clone(),
+                actual: kid.clone(),
+            });
+        }
+    }
+
+    let mut signing_input = Vec::new();
+    signing_input.extend_from_slice(jws.protected.as_bytes());
+    signing_input.push(b'.');
+    signing_input.extend_from_slice(jws.payload.as_bytes());
 
     let sig_bytes = URL_SAFE_NO_PAD
         .decode(&jws.signature)

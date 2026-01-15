@@ -4,7 +4,11 @@ use crate::negotiation::NegotiatedCapabilities;
 use std::collections::HashSet;
 
 pub const AP2_MANDATE_CAPABILITY: &str = "dev.ucp.shopping.ap2_mandate";
+#[allow(dead_code)]
 pub const ORDER_CAPABILITY: &str = "dev.ucp.shopping.order";
+pub const FULFILLMENT_CAPABILITY: &str = "dev.ucp.shopping.fulfillment";
+pub const DISCOUNT_CAPABILITY: &str = "dev.ucp.shopping.discount";
+pub const BUYER_CONSENT_CAPABILITY: &str = "dev.ucp.shopping.buyer_consent";
 
 pub fn requires_ap2_mandate(
     negotiated: Option<&NegotiatedCapabilities>,
@@ -33,6 +37,20 @@ pub fn apply_negotiated_checkout(
 
     if !allowed.contains(AP2_MANDATE_CAPABILITY) {
         checkout.ap2 = None;
+    }
+
+    if !allowed.contains(FULFILLMENT_CAPABILITY) {
+        checkout.fulfillment = None;
+    }
+
+    if !allowed.contains(DISCOUNT_CAPABILITY) {
+        checkout.discounts = None;
+    }
+
+    if !allowed.contains(BUYER_CONSENT_CAPABILITY) {
+        if let Some(buyer) = checkout.buyer.as_mut() {
+            buyer.consent = None;
+        }
     }
 }
 

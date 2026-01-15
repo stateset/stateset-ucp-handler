@@ -9,6 +9,7 @@
 use crate::crypto::{load_verifying_key, VerifyingKey};
 use crate::models::{Capability, CapabilityRef, DiscoveryDocument, JwkKey, PaymentHandler};
 use reqwest::Client;
+use sfv::{BareItem, ListEntry, Parser};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -282,62 +283,40 @@ pub fn parse_ucp_agent(header_value: &str) -> Result<UcpAgent, NegotiationError>
     let mut profile_url = None;
     let mut params = HashMap::new();
 
-    // Parse RFC 8941 Dictionary-like format
-    // This is a simplified parser - for full compliance, use the sfv crate
-    for item in split_dictionary_items(header_value) {
-        let item = item.trim();
-        if item.is_empty() {
-            continue;
-        }
+    let dictionary = Parser::parse_dictionary(header_value.as_bytes()).map_err(|err| {
+        NegotiationError::InvalidUcpAgentFormat(err.to_string())
+    })?;
 
-        if let Some((key, value)) = parse_dictionary_item(item) {
-            if key == "profile" {
-                profile_url = Some(value);
-            } else {
-                params.insert(key, value);
+    for (key, entry) in dictionary {
+        let value = match entry {
+            ListEntry::Item(item) => match item.bare_item {
+                BareItem::String(value) => Some(value),
+                BareItem::Token(value) => Some(value),
+                BareItem::Boolean(value) => Some(value.to_string()),
+                BareItem::Integer(value) => Some(value.to_string()),
+                BareItem::Decimal(value) => Some(value.to_string()),
+                BareItem::ByteSeq(_) => None,
+            },
+            ListEntry::InnerList(_) => None,
+        };
+
+        if key == "profile" {
+            match value {
+                Some(value) => {
+                    profile_url = Some(value);
+                }
+                None => {
+                    return Err(NegotiationError::InvalidUcpAgentFormat(
+                        "UCP-Agent profile must be a string".to_string(),
+                    ));
+                }
             }
+        } else if let Some(value) = value {
+            params.insert(key, value);
         }
     }
 
     Ok(UcpAgent { profile_url, params })
-}
-
-/// Splits dictionary items, handling quoted strings
-fn split_dictionary_items(s: &str) -> Vec<&str> {
-    let mut items = Vec::new();
-    let mut start = 0;
-    let mut in_quotes = false;
-
-    for (i, c) in s.char_indices() {
-        match c {
-            '"' => in_quotes = !in_quotes,
-            ',' if !in_quotes => {
-                items.push(&s[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-
-    if start < s.len() {
-        items.push(&s[start..]);
-    }
-
-    items
-}
-
-/// Parses a single dictionary item (key=value or key="value")
-fn parse_dictionary_item(item: &str) -> Option<(String, String)> {
-    let eq_pos = item.find('=')?;
-    let key = item[..eq_pos].trim().to_string();
-    let mut value = item[eq_pos + 1..].trim();
-
-    // Remove quotes if present
-    if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
-        value = &value[1..value.len() - 1];
-    }
-
-    Some((key, value.to_string()))
 }
 
 // ============================================================================
@@ -451,16 +430,12 @@ pub async fn negotiate(
     // Parse UCP-Agent header
     let ucp_agent = parse_ucp_agent(header_value)?;
 
-    // If no profile URL, return all business capabilities
-    let Some(profile_url) = ucp_agent.profile_url else {
-        debug!("No profile URL in UCP-Agent, using all business capabilities");
-        return Ok(NegotiatedCapabilities {
-            version: business_version.to_string(),
-            capabilities: capabilities_to_refs(business_capabilities),
-            platform_signing_keys: Vec::new(),
-            platform_webhook_url: None,
-        });
-    };
+    // Require profile URL when UCP-Agent header is present
+    let profile_url = ucp_agent
+        .profile_url
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or(NegotiationError::MissingProfileUrl)?;
 
     // Fetch platform profile
     let platform_profile = profile_cache.fetch_profile(&profile_url).await?;

@@ -3,7 +3,7 @@
 //! Signs webhook payloads using RFC 7797 detached JWS signatures
 //! per the UCP Order capability specification.
 
-use crate::crypto::{canonicalize, sign_detached, SigningKey};
+use crate::crypto::{sign_detached, SigningKey};
 use crate::errors::ServiceError;
 use crate::models::OrderEvent;
 use chrono::{DateTime, Utc};
@@ -47,6 +47,7 @@ pub struct OrderWebhook {
 
 impl OrderWebhook {
     /// Creates a new OrderWebhook with legacy static signature.
+    #[allow(dead_code)]
     pub fn new(
         webhook_url: Option<String>,
         api_key: Option<String>,
@@ -147,8 +148,13 @@ impl OrderWebhook {
     /// The payload is signed using either:
     /// 1. JWS detached signature (if signing_key is configured)
     /// 2. Legacy static signature (if legacy_signature is configured)
-    pub async fn send_order_event(&self, event: &OrderEvent) -> Result<(), ServiceError> {
-        let Some(url) = self.webhook_url.as_deref() else {
+    pub async fn send_order_event(
+        &self,
+        event: &OrderEvent,
+        webhook_url: Option<&str>,
+    ) -> Result<(), ServiceError> {
+        let url = webhook_url.or(self.webhook_url.as_deref());
+        let Some(url) = url else {
             debug!("No webhook URL configured, skipping order event delivery");
             return Ok(());
         };
@@ -159,15 +165,8 @@ impl OrderWebhook {
         })?;
 
         let signature_header = if let Some(key) = &self.signing_key {
-            // Use proper JWS signature
-            let event_value: serde_json::Value = serde_json::from_slice(&payload_json)
-                .map_err(|e| ServiceError::External(format!("JSON parse error: {}", e)))?;
-
-            let canonical_payload = canonicalize(&event_value).map_err(|e| {
-                ServiceError::External(format!("Failed to canonicalize payload: {}", e))
-            })?;
-
-            let jws = sign_detached(&canonical_payload, key).map_err(|e| {
+            // Use proper JWS signature (RFC 7797) over the raw request body.
+            let jws = sign_detached(&payload_json, key).map_err(|e| {
                 ServiceError::External(format!("Failed to sign webhook payload: {}", e))
             })?;
 
