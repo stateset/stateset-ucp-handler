@@ -1,5 +1,6 @@
 # Rust build artifacts
 /target
+/target2
 /target-local
 
 # Environment and secrets
@@ -15,6 +16,11 @@ Thumbs.db
 # Logs
 *.log
 server.log
+
+# Local test artifacts
+/commerce.db
+/.rename_test/
+/.rename_test2/
 
 # IDE
 .idea/
